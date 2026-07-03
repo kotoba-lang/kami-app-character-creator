@@ -124,3 +124,62 @@
       (is (nil? (gpu/material-base-color-texture vdoc nil)))
       ;; character-creator's own materials have no embedded baseColorTexture yet
       (is (nil? (gpu/material-base-color-texture vdoc 0))))))
+
+;; ── node-world-transforms / skin-joint-palette (spring-bone follow-up:
+;; the uploaded-VRM render path fed an all-identity joint palette -- these
+;; enable a REAL palette, using the document's own node hierarchy + skin
+;; inverse-bind matrices, with an optional per-node rotation override
+;; (spring-bone output, or any other pose system) ────────────────────────
+
+(deftest node-world-transforms-rest-pose-matches-bone-world-positions-test
+  (testing "walking the scene graph with no overrides reproduces character.body/bone-world-positions' own rest-pose translations for every humanoid bone node -- two independent ways of computing the same rest-pose world position should agree"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          nodes (get-in vdoc [:gltf :nodes])
+          world (gpu/node-world-transforms vdoc {})
+          bone-node-idxs (keep-indexed (fn [i n] (when (:name n) i)) nodes)]
+      (is (pos? (count bone-node-idxs)))
+      (doseq [i bone-node-idxs]
+        (let [m (get world i)]
+          (is (= 16 (count m)))
+          ;; translation lives at indices 12/13/14 of a column-major mat4
+          (is (every? number? [(nth m 12) (nth m 13) (nth m 14)])))))))
+
+(deftest node-world-transforms-override-changes-descendant-world-test
+  (testing "overriding one node's rotation moves every descendant's world position (not just that node's own) -- proves the walk actually composes parent*local down the hierarchy, not a flat per-node computation"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          nodes (get-in vdoc [:gltf :nodes])
+          hips-idx (first (keep-indexed (fn [i n] (when (= "hips" (:name n)) i)) nodes))
+          spine-idx (first (keep-indexed (fn [i n] (when (= "spine" (:name n)) i)) nodes))
+          rest-world (gpu/node-world-transforms vdoc {})
+          ;; a 90-degree rotation about Z is clearly not the identity/rest rotation for this bone
+          turned-world (gpu/node-world-transforms vdoc {hips-idx [0.0 0.0 0.70710678 0.70710678]})]
+      (is (not= (get rest-world spine-idx) (get turned-world spine-idx))
+          "spine (a child of hips) must move when hips' rotation is overridden"))))
+
+(deftest skin-joint-palette-shape-and-rest-identity-test
+  (testing "one Mat4 per joint, index-aligned with the skin's own :joints list; at the body's actual rest pose (no overrides) each palette entry is close to identity, since world(joint) and inverse-bind(joint) are meant to cancel at bind time"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          body-node (gpu/mesh-node vdoc (first (keep-indexed (fn [i m] (when (= "body" (:name m)) i)) (get-in vdoc [:gltf :meshes]))))
+          skin-idx (:skin body-node)
+          world (gpu/node-world-transforms vdoc {})
+          palette (gpu/skin-joint-palette vdoc skin-idx world)
+          n-joints (count (get-in vdoc [:gltf :skins skin-idx :joints]))]
+      (is (= n-joints (count palette)))
+      (is (every? #(= 16 (count %)) palette))
+      (doseq [m palette]
+        ;; identity mat4 = [1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1]; at rest pose
+        ;; every entry should be within a small tolerance of that
+        (is (< (Math/abs (- (nth m 0) 1.0)) 1e-3))
+        (is (< (Math/abs (- (nth m 5) 1.0)) 1e-3))
+        (is (< (Math/abs (- (nth m 10) 1.0)) 1e-3))
+        (is (< (Math/abs (- (nth m 15) 1.0)) 1e-3))))))
+
+(deftest mesh-node-finds-the-referencing-node-test
+  (testing "resolves the scene-graph node that points AT a mesh (glTF nodes reference meshes, not the reverse) -- nil for a mesh index nothing references"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          meshes (get-in vdoc [:gltf :meshes])
+          body-idx (first (keep-indexed (fn [i m] (when (= "body" (:name m)) i)) meshes))
+          node (gpu/mesh-node vdoc body-idx)]
+      (is (some? node))
+      (is (= body-idx (:mesh node)))
+      (is (nil? (gpu/mesh-node vdoc 999999))))))

@@ -10,8 +10,17 @@
   host loader to resolve — no such loader exists, and it carries no vertex data
   itself). This namespace + `kami.webgpu.mesh` (in `kotoba-lang/webgpu`) are that
   missing loader/renderer pair, scoped to what Phase 1's generated avatar
-  actually has: a morphable, unskinned head mesh."
+  actually has: a morphable, unskinned head mesh.
+
+  Node-hierarchy world-transform + skin-palette support (/loop maturity pass,
+  spring-bone follow-up): added so an UPLOADED VRM's real skeleton (not the
+  procedural character's synthetic bone list) can be posed — needed both to
+  feed `vrm.spring/step`'s `node-world` argument and to compute the actual
+  per-joint palette matrices `kami.webgpu.mesh/draw!` skins vertices with.
+  Before this, the uploaded-VRM render path fed an all-identity joint palette
+  (rest pose only, spring bones explicitly deferred at the time)."
   (:require [vrm.convert :as conv]
+            [vrm.math :as m]
             [character.blendshape :as blendshape]))
 
 (defn- accessor->vec3s
@@ -191,3 +200,82 @@
                 v))
             base
             (get preset->arkit-weights preset []))))
+
+;; ─── node-hierarchy world transforms + skin palettes (spring-bone follow-up) ──
+
+(defn- node-local-matrix
+  "One glTF node's local TRS matrix. `translation`/`scale` default per the
+  glTF spec (`[0 0 0]`/`[1 1 1]`); `rotation` defaults to identity UNLESS
+  `override-rot` is given (a spring-bone override for this node this frame,
+  in the same `[x y z w]` shape `vrm.spring/step`'s `overrides` returns)."
+  [node override-rot]
+  (m/mat4-from-scale-rotation-translation
+   (or (:scale node) m/vec3-one)
+   (or override-rot (:rotation node) [0.0 0.0 0.0 1.0])
+   (or (:translation node) m/vec3-zero)))
+
+(defn node-world-transforms
+  "Every node's world matrix, walking the scene graph from `(:scenes
+  (:scene gltf))`'s roots down through `:children` — `node-idx -> Mat4`
+  (a plain map, not a vector, since a node's own index may exceed how many
+  nodes are actually reachable from the active scene, though in practice
+  every VRM node is scene-reachable). `overrides` (`{node-idx [x y z w]}`,
+  the exact shape `vrm.spring/step` returns, reduced to a map) replaces a
+  node's own rest rotation with a spring-bone (or any other pose system's)
+  override for this frame — every non-overridden node still gets its own
+  rest rotation, so calling this with `{}` gives the rest-pose world
+  transforms (what the uploaded-VRM render path used, implicitly, before
+  this pass — identity joint MATRICES happened to be wrong for a real
+  skinned mesh even at rest, since a real skin's inverse-bind matrices are
+  never identity; see `skin-joint-palette` below, which this enables)."
+  [vdoc overrides]
+  (let [gltf (:gltf vdoc)
+        nodes (:nodes gltf)
+        scene-idx (or (:scene gltf) 0)
+        roots (get-in gltf [:scenes scene-idx :nodes] [])]
+    (loop [queue (mapv (fn [i] [i m/mat4-identity]) roots)
+           acc {}]
+      (if (empty? queue)
+        acc
+        (let [[node-idx parent-world] (first queue)
+              node (get nodes node-idx)
+              local (node-local-matrix node (get overrides node-idx))
+              world (m/mat4-mul parent-world local)
+              children (mapv (fn [c] [c world]) (:children node))]
+          (recur (into (vec (rest queue)) children) (assoc acc node-idx world)))))))
+
+(defn skin-joint-palette
+  "`skin-idx`'s joint palette — one 16-float column-major Mat4 (a plain
+  Clojure vector, the exact shape `kami.webgpu.mesh/draw!`'s `joint-
+  matrices` arg wants) per joint, index-aligned with `JOINTS_0`'s values
+  (i.e. `(nth (skin-joint-palette ...) j)` is the matrix for local joint
+  slot `j`, matching `skins[skin-idx].joints[j]`'s real node). Standard
+  skinning formula: `palette[j] = world(joints[j]) * inverseBind[j]` — the
+  inverse-bind matrix first moves a vertex from mesh-local space into
+  joint `j`'s OWN bind-local space, then the joint's current world matrix
+  moves it back out to world space at its current (possibly spring-posed)
+  orientation. `node-world` is a `node-idx -> Mat4` map (typically
+  `node-world-transforms`'s output)."
+  [vdoc skin-idx node-world]
+  (let [gltf (:gltf vdoc)
+        skin (get-in gltf [:skins skin-idx])
+        joints (:joints skin)
+        inv-binds (when-let [acc (:inverseBindMatrices skin)]
+                    (->> (conv/read-accessor-f32 vdoc acc) (partition 16) (mapv vec)))]
+    (mapv (fn [i joint-node]
+            (let [world (get node-world joint-node m/mat4-identity)
+                  inv-bind (if inv-binds (nth inv-binds i) m/mat4-identity)]
+              (m/mat4-mul world inv-bind)))
+          (range (count joints))
+          joints)))
+
+(defn mesh-node
+  "The scene-graph node that references `mesh-idx` (glTF nodes point AT a
+  mesh, not the reverse), or `nil` if none does. A mesh's `:skin` (needed
+  for `skin-joint-palette`) lives on this NODE, not on the mesh or any of
+  its primitives — `primitive->geometry` above only surfaces per-vertex
+  `JOINTS_0`/`WEIGHTS_0`, never the skin index itself, since a primitive
+  has no way to know it without this lookup."
+  [vdoc mesh-idx]
+  (let [nodes (get-in vdoc [:gltf :nodes])]
+    (first (filter #(= mesh-idx (:mesh %)) nodes))))
