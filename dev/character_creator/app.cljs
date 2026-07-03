@@ -26,6 +26,7 @@
             [character-creator.expression-bridge :as bridge]
             [character-creator.thumbnail :as thumb]
             [character-creator.persistence :as persist]
+            [character-creator.accessories :as acc]
             [character.params :as params]
             [character.body :as cbody]
             [kami.webgpu.mesh :as mesh]
@@ -77,6 +78,31 @@
 
 (defn- identity-mat4 [] (js/Float32Array. #js [1 0 0 0, 0 1 0 0, 0 0 1 0, 0 0 0 1]))
 
+;; ─── accessories/decals: head-group vs body-group routing -----------------
+;; The render loop (below) draws head and body as two separately-fitted/
+;; -translated "portraits" side by side, not one composited standing figure
+;; (an existing choice this fn doesn't change) — hair already follows this by
+;; sharing `head-fit`/`head-mvp`. An accessory/decal must do the same: which
+;; fit/translate it uses depends on which bone it's attached to.
+
+(def ^:private head-attach-bones #{"head" "leftEye" "rightEye" "jaw"})
+
+(defn- extra-group
+  "`:head` or `:body`, from `character-creator.accessories`' catalog
+   `:attach-bone` for `id` (an equip or decal id)."
+  [id]
+  (let [attach (:attach-bone (or (get acc/accessory-catalog id) (get acc/decal-catalog id)))]
+    (if (contains? head-attach-bones attach) :head :body)))
+
+(defn- extra-color
+  "Flat draw-call colour for `id` — this shader takes one colour per draw
+   call (see the palette-colour comment in the render loop below), not
+   per-vertex material data, so an accessory/decal draws in its own catalog
+   `:base-color` (RGB, alpha dropped)."
+  [id]
+  (let [[r g b] (:base-color (or (get acc/accessory-catalog id) (get acc/decal-catalog id)))]
+    [r g b]))
+
 ;; ─── regen: CharacterDoc -> re-uploaded GPU buffers -----------------------
 ;; Public entry point every control's `:on-change` calls. No debouncing —
 ;; per directive, measure real timing first (logged below) and only add
@@ -110,16 +136,34 @@
                         mctx {:positions (fit-positions (:positions hair-geo) head-fit)
                               :normals (:normals hair-geo)
                               :indices (:indices hair-geo)}))
+        ;; accessories/decals: same mesh-geometry-by-name reader `hair` uses
+        ;; (works unchanged since accessory/decal MeshParts are shaped like
+        ;; any other part), each fit'd via whichever of head-fit/body-fit its
+        ;; `extra-group` says it belongs to.
+        extra-ids (into (vec (:character/equip @!doc)) (:character/decals @!doc))
+        extras (into {}
+                     (keep (fn [id]
+                             (when-let [geo (gpu/mesh-geometry-by-name vdoc (name id))]
+                               (let [fit (if (= :head (extra-group id)) head-fit body-fit)]
+                                 [id {:buffers (mesh/upload-mesh!
+                                                mctx {:positions (fit-positions (:positions geo) fit)
+                                                      :normals (:normals geo)
+                                                      :indices (:indices geo)})
+                                      :group (extra-group id)
+                                      :color (extra-color id)}])))
+                           extra-ids))
         dt (- (js/performance.now) t0)]
     (reset! !morph-names (:morph-target-names head-geo))
-    (reset! !buffers {:head head-buffers :body body-buffers :hair hair-buffers})
+    (reset! !buffers {:head head-buffers :body body-buffers :hair hair-buffers :extras extras})
     (log "regen took" (.toFixed dt 1) "ms — head verts:" (count (:positions head-geo))
          "body verts:" (count (:positions body-geo))
-         "hair verts:" (if hair-geo (count (:positions hair-geo)) 0))
+         "hair verts:" (if hair-geo (count (:positions hair-geo)) 0)
+         "extras:" (vec (keys extras)))
     (set! (.-__kami_cc_last_regen_ms js/window) dt)
     (set! (.-__kami_cc_regen_count js/window) (inc (or (.-__kami_cc_regen_count js/window) 0)))
     (set! (.-__kami_cc_last_hair_verts js/window) (if hair-geo (count (:positions hair-geo)) 0))
-    (set! (.-__kami_cc_last_hair_preset js/window) (name (get-in @!doc [:character/def :hair :preset])))))
+    (set! (.-__kami_cc_last_hair_preset js/window) (name (get-in @!doc [:character/def :hair :preset])))
+    (set! (.-__kami_cc_last_extras js/window) (clj->js (mapv name (keys extras))))))
 
 (defn- update-def! [mctx path v]
   (swap! !doc assoc-in (into [:character/def] path) v)
@@ -191,6 +235,46 @@
           (.appendChild svg el)))
       svg)))
 
+;; ─── equip/decal slot picking — one `carousel!` per SLOT (not per catalog
+;; entry), each including a "None" option, so choosing e.g. a cap doesn't
+;; block also wearing a necklace (different slots) but does replace any
+;; other headwear (same slot) — a small, deliberately-scoped equip-slot
+;; system, not arbitrary multi-select checkboxes (`carousel!` is single-
+;; value; this is the natural fit for it). ------------------------------
+
+(def ^:private equip-slots
+  "slot-key -> the `character-creator.accessories/accessory-catalog` ids
+   that occupy it (mutually exclusive within a slot, independent across
+   slots)."
+  {:headwear [:cap-simple :glasses-round]
+   :jewelry [:earring-stud :necklace-simple]})
+
+(defn- set-equip-slot! [mctx slot id]
+  (swap! !doc update :character/equip
+         (fn [equip]
+           (let [without-slot (vec (remove (set (get equip-slots slot)) equip))]
+             (if id (conj without-slot id) without-slot))))
+  (regen! mctx))
+
+(defn- set-decal! [mctx id]
+  ;; single decal at a time — a real multi-decal picker needs a different
+  ;; (checkbox-style) widget than the single-value `carousel!`; scoped down
+  ;; deliberately, `character-creator.pipeline` itself supports a full
+  ;; vector, this UI just doesn't expose more than one slot yet.
+  (swap! !doc assoc :character/decals (if id [id] []))
+  (regen! mctx))
+
+(defn- slot-carousel!
+  [container mctx {:keys [test-id ids current on-select]}]
+  (let [row (.createElement js/document "div")]
+    (.setAttribute row "data-testid" test-id)
+    (.appendChild container row)
+    (w/carousel! row
+      {:items (into [{:id :none :label "None"}]
+                    (mapv (fn [id] {:id id :label (name id)}) ids))
+       :value (or current :none)
+       :on-change (fn [item] (on-select (when-not (= :none (:id item)) (:id item))))})))
+
 (defn- build-controls! [container mctx]
   (panel-heading container "Body / Face")
   (doseq [[path label lo hi step] sliders]
@@ -230,6 +314,24 @@
                      (sort params/hair-presets))
        :value (get-def [:hair :preset])
        :on-change (fn [item] (update-def! mctx [:hair :preset] (:id item)))}))
+
+  (panel-heading container "Headwear")
+  (slot-carousel! container mctx
+    {:test-id "headwear-carousel" :ids (:headwear equip-slots)
+     :current (some (set (:headwear equip-slots)) (:character/equip @!doc))
+     :on-select (fn [id] (set-equip-slot! mctx :headwear id))})
+
+  (panel-heading container "Jewelry")
+  (slot-carousel! container mctx
+    {:test-id "jewelry-carousel" :ids (:jewelry equip-slots)
+     :current (some (set (:jewelry equip-slots)) (:character/equip @!doc))
+     :on-select (fn [id] (set-equip-slot! mctx :jewelry id))})
+
+  (panel-heading container "Tattoo / Scar")
+  (slot-carousel! container mctx
+    {:test-id "decal-carousel" :ids (keys acc/decal-catalog)
+     :current (first (:character/decals @!doc))
+     :on-select (fn [id] (set-decal! mctx id))})
 
   (panel-heading container "Expression preview")
   (let [row (.createElement js/document "div")]
@@ -296,7 +398,7 @@
                 ((fn tick []
                    (js/requestAnimationFrame
                      (fn [_]
-                       (when-let [{:keys [head body hair]} @!buffers]
+                       (when-let [{:keys [head body hair extras]} @!buffers]
                          (let [hair-mesh hair ;; disambiguate from the palette `:hair` color, below
                                vp (mesh/view-projection [0 0.25 2.4] [0 0 0] (/ w (max 1 h)))
                                translate (fn [tx ty] (js/Float32Array. #js [1 0 0 0, 0 1 0 0, 0 0 1 0, tx ty 0 1]))
@@ -334,6 +436,8 @@
                            (mesh/draw! mctx pass head head-mvp skin weights [])
                            (mesh/draw! mctx pass body body-mvp skin [] joints)
                            (when hair-mesh (mesh/draw! mctx pass hair-mesh hair-mvp hair-color [] []))
+                           (doseq [[_id {:keys [buffers group color]}] extras]
+                             (mesh/draw! mctx pass buffers (if (= :head group) head-mvp body-mvp) color [] []))
                            (.end pass)
                            (.submit (.-queue device) #js [(.finish enc)])))
                        (tick))))

@@ -205,7 +205,13 @@
    chosen direction is the pragmatic honest approximation, not a bug."
   {:tattoo-arm-band
    {:label "Arm band tattoo" :attach-bone "leftLowerArm"
-    :offset [-0.05 0.0 0.0] :normal [0.0 0.0 1.0] :half-size [0.02 0.012]
+    ;; `arm-mesh`'s radius at this point along the forearm is ~0.02-0.03 —
+    ;; the z=0.035 here (not the small hair's-width `generate-decal-part`
+    ;; epsilon alone) is what actually clears the arm cylinder's surface;
+    ;; an earlier version used only the epsilon and the decal rendered
+    ;; fully embedded/invisible inside the arm (caught by this session's
+    ;; own headless-Chrome content-hash verification, not eyeballed).
+    :offset [-0.05 0.0 0.035] :normal [0.0 0.0 1.0] :half-size [0.02 0.012]
     :base-color [0.12 0.16 0.35 1.0]}                          ;; wraps the forearm, facing +Z (front)
    :tattoo-shoulder
    {:label "Shoulder tattoo" :attach-bone "leftShoulder"
@@ -218,13 +224,20 @@
 
 (defn generate-decal-part
   "Like `generate-accessory-part` but for `decal-catalog` — a single flat
-   quad (`orient-to-normal` + `offset-part`) offset a hair's-width (`0.002`)
-   outward along `:normal` from the attach point so it doesn't z-fight the
-   skin/clothing mesh underneath. Returns `nil` for an unknown id."
+   quad (`orient-to-normal` + `offset-part`) offset a small clearance
+   (`0.006`) outward along `:normal` from the attach point so it doesn't
+   z-fight/embed inside the skin/clothing mesh underneath — note each
+   catalog entry's own `:offset` (not this fn's fixed clearance alone) is
+   what does the bulk of the work reaching an attached limb's actual
+   surface (e.g. `:tattoo-arm-band`'s own comment: the forearm's ~0.02-0.03
+   radius needs the offset itself to clear it, a flat epsilon here isn't
+   enough — an earlier version relied on the epsilon alone and rendered
+   fully embedded/invisible, caught by headless-Chrome content-hash
+   verification). Returns `nil` for an unknown id."
   [id bone-world-pos-by-name]
   (when-let [{:keys [attach-bone offset normal half-size]} (get decal-catalog id)]
     (let [origin (v3+ (get bone-world-pos-by-name attach-bone [0.0 0.0 0.0])
-                       (v3+ offset (v3* (v3-norm normal) 0.002)))
+                       (v3+ offset (v3* (v3-norm normal) 0.006)))
           [hw hh] half-size
           part (orient-to-normal (quad-mesh hw hh) normal origin)]
       (assoc part :name (name id) :material id))))

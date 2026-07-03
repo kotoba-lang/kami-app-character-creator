@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>verify accessories/decals interactivity</title>
+<style>
+  body { background: #f0ead6; color: #2d3436; font-family: sans-serif; margin: 0; padding: 16px; }
+  #app { display: flex; gap: 20px; align-items: flex-start; }
+  #gpu-canvas { width: 560px; height: 480px; display: block; background: #000; }
+  #controls { width: 300px; display: flex; flex-direction: column; gap: 10px; }
+  #status { padding: 8px 0; font-size: 13px; font-weight: 800; }
+  #results { white-space: pre; font-family: monospace; font-size: 12px; background: #fff; padding: 8px; }
+</style>
+</head>
+<body>
+<div id="status">loading…</div>
+<div id="app">
+  <canvas id="gpu-canvas"></canvas>
+  <div id="controls"></div>
+</div>
+<div id="results">pending…</div>
+<script src="dev/out-app/app.js"></script>
+<script>
+function log(line) {
+  var el = document.getElementById('results');
+  el.textContent += line + "\n";
+  console.log('[verify-accessories]', line);
+}
+function waitFor(pred, timeoutMs, cb) {
+  var start = Date.now();
+  (function poll() {
+    if (pred()) { cb(true); return; }
+    if (Date.now() - start > timeoutMs) { cb(false); return; }
+    setTimeout(poll, 100);
+  })();
+}
+function hashStr(s) {
+  var h = 5381;
+  for (var i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h;
+}
+window.__snap = {};
+function screenshotMarker(name) {
+  var canvas = document.getElementById('gpu-canvas');
+  try {
+    var data = canvas.toDataURL('image/png');
+    window.__snap[name] = { len: data.length, hash: hashStr(data) };
+    log(name + ': canvas dataURL length=' + data.length + ' hash=' + window.__snap[name].hash +
+        ' extras=' + (window.__kami_cc_last_extras ? JSON.stringify(window.__kami_cc_last_extras) : '[]'));
+  } catch (e) { log(name + ': toDataURL failed: ' + e); }
+}
+function clickNextArrow(testId) {
+  var row = document.querySelector('[data-testid="' + testId + '"]');
+  if (!row) { log('FAIL: ' + testId + ' not found'); return false; }
+  var arrow = Array.prototype.filter.call(row.querySelectorAll('button'),
+    function (b) { return b.textContent === '›'; })[0];
+  if (!arrow) { log('FAIL: no next-arrow in ' + testId); return false; }
+  arrow.click();
+  return true;
+}
+
+waitFor(function () { return window.__kami_cc_ready === true; }, 20000, function (ready) {
+  if (!ready) { log('FAIL: app never signaled ready (WebGPU init likely failed)'); return; }
+  log('PASS: app ready');
+  setTimeout(function () {
+    screenshotMarker('initial');
+
+    log('paging headwear-carousel forward once (None -> cap-simple)');
+    if (!clickNextArrow('headwear-carousel')) return;
+
+    setTimeout(function () {
+      screenshotMarker('after-headwear');
+
+      log('paging jewelry-carousel forward twice (None -> earring-stud -> necklace-simple)');
+      clickNextArrow('jewelry-carousel');
+      clickNextArrow('jewelry-carousel');
+
+      setTimeout(function () {
+        screenshotMarker('after-jewelry');
+
+        log('paging decal-carousel forward once (None -> a tattoo/scar)');
+        if (!clickNextArrow('decal-carousel')) return;
+
+        setTimeout(function () {
+          screenshotMarker('after-decal');
+
+          var a = window.__snap['initial'], b = window.__snap['after-headwear'],
+              c = window.__snap['after-jewelry'], d = window.__snap['after-decal'];
+          log('---');
+          log('hashes: initial=' + (a && a.hash) + ' after-headwear=' + (b && b.hash) +
+              ' after-jewelry=' + (c && c.hash) + ' after-decal=' + (d && d.hash));
+          log(((a && b && a.hash !== b.hash) ? 'PASS' : 'FAIL') + ': render changed after equipping headwear');
+          log(((b && c && b.hash !== c.hash) ? 'PASS' : 'FAIL') + ': render changed after equipping jewelry');
+          log(((c && d && c.hash !== d.hash) ? 'PASS' : 'FAIL') + ': render changed after applying decal');
+          log('DONE');
+        }, 700);
+      }, 700);
+    }, 700);
+  }, 1500);
+});
+</script>
+</body>
+</html>
