@@ -9,8 +9,21 @@
 
   Browser-only (`:cljs`) by nature; `:clj` throws a clear error rather than
   silently no-op'ing, so a JVM caller finds out immediately if it's wired
-  in wrong."
-  (:require [vrm.glb :as glb]))
+  in wrong.
+
+  Real bug fixed here (/loop maturity pass, caught by actual browser
+  verification, not eyeballed): `load-local` called a bare `read-string`
+  under `:cljs` with no `cljs.reader`/`cljs.tools.reader.edn` required —
+  `cljs.core` does not define a global `read-string`, so this compiled
+  clean but threw `TypeError: Cannot read properties of undefined (reading
+  'call')` at runtime on every real load, silently swallowed by the calling
+  `when-let` in `character-creator.app/load!` (nil -> no-op). Fixed with an
+  explicit EDN reader require, `clojure.edn`/`cljs.reader` (not
+  `clojure.core/read-string`, which can `eval` arbitrary forms — `edn/read-
+  string` is the safe reader for data written by our own `pr-str`, matching
+  what `save-local!` produces)."
+  (:require [vrm.glb :as glb]
+            #?(:clj [clojure.edn :as edn] :cljs [cljs.reader :as edn])))
 
 (def ^:private storage-key-prefix "kami-character-creator/")
 
@@ -27,7 +40,7 @@
 (defn load-local
   "Load a previously-saved `CharacterDoc` by id, or `nil`."
   [id]
-  #?(:cljs (some-> (.getItem js/localStorage (str storage-key-prefix id)) read-string)
+  #?(:cljs (some-> (.getItem js/localStorage (str storage-key-prefix id)) edn/read-string)
      :clj (not-browser! "load-local")))
 
 (defn list-local-ids
