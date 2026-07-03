@@ -55,3 +55,61 @@
     (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))]
       (is (nil? (gpu/mesh-base-color-texture vdoc "body")))
       (is (nil? (gpu/mesh-base-color-texture vdoc "nonexistent-mesh"))))))
+
+;; ── multi-primitive meshes (real bug fix, /loop maturity pass): every
+;; mesh-* reader used to hardcode `:primitives 0`, silently dropping every
+;; primitive after the first. character-creator's own generated parts are
+;; all single-primitive so this was invisible against this app's own
+;; output -- a real parsed VRM (VRoid Studio's standard export shape)
+;; commonly gives a head mesh 2-3 primitives with distinct materials.
+;; Synthetic fixture: split a real mesh's sole primitive into two,
+;; assigning each a distinct material index, to prove the reader now
+;; surfaces both instead of only the first. ─────────────────────────────
+
+(defn- split-mesh-into-two-primitives
+  "Test helper: given a real `VrmDocument` and a mesh name whose mesh has
+  exactly one primitive, returns a `VrmDocument` where that mesh now has
+  TWO primitives -- the original, and a copy of it reassigned to material
+  index `alt-material-idx`. Both primitives share the same accessors (same
+  geometry data) since this test only cares about primitive COUNT and
+  per-primitive :material resolution, not distinct geometry per primitive."
+  [vdoc mesh-name alt-material-idx]
+  (let [meshes (get-in vdoc [:gltf :meshes])
+        mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))
+        prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])
+        alt-prim (assoc prim :material alt-material-idx)]
+    (update-in vdoc [:gltf :meshes mesh-idx :primitives] conj alt-prim)))
+
+(deftest mesh-primitives-by-name-reads-every-primitive-test
+  (testing "a real bug: mesh-geometry-by-name used to hardcode :primitives 0, dropping every other primitive -- mesh-primitives-by-name now returns all of them"
+    (let [vdoc0 (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          orig-material (:material (gpu/mesh-geometry-by-name vdoc0 "body"))
+          alt-material (if (zero? orig-material) 1 0) ;; any distinct index -- this doc's :materials count is >= 2
+          vdoc (split-mesh-into-two-primitives vdoc0 "body" alt-material)
+          prims (gpu/mesh-primitives-by-name vdoc "body")]
+      (is (= 2 (count prims)))
+      (is (= orig-material (:material (nth prims 0))))
+      (is (= alt-material (:material (nth prims 1))))
+      ;; both primitives decode real, non-empty geometry (not just the first)
+      (is (every? #(pos? (count (:positions %))) prims))
+      (is (every? #(pos? (count (:indices %))) prims)))))
+
+(deftest mesh-geometry-by-name-still-returns-only-first-primitive-test
+  (testing "mesh-geometry-by-name stays a thin first-primitive wrapper -- backward compatible for every existing single-primitive caller"
+    (let [vdoc0 (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          orig-material (:material (gpu/mesh-geometry-by-name vdoc0 "body"))
+          alt-material (if (zero? orig-material) 1 0)
+          vdoc (split-mesh-into-two-primitives vdoc0 "body" alt-material)]
+      (is (= orig-material (:material (gpu/mesh-geometry-by-name vdoc "body")))))))
+
+(deftest mesh-primitives-by-name-missing-mesh-returns-empty-vec-test
+  (testing "no mesh with that name -> [] (mirrors mesh-geometry-by-name's nil-for-missing convention)"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))]
+      (is (= [] (gpu/mesh-primitives-by-name vdoc "nonexistent-mesh"))))))
+
+(deftest material-base-color-texture-nil-material-idx-test
+  (testing "material-base-color-texture takes a material index directly (for per-primitive resolution) and is nil-safe"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))]
+      (is (nil? (gpu/material-base-color-texture vdoc nil)))
+      ;; character-creator's own materials have no embedded baseColorTexture yet
+      (is (nil? (gpu/material-base-color-texture vdoc 0))))))

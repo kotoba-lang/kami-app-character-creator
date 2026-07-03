@@ -51,6 +51,44 @@
   [vdoc]
   (mesh-geometry vdoc 0))
 
+(defn- primitive->geometry
+  "One glTF primitive map -> `{:positions :normals :indices :material :joints
+  :weights :uvs}` (the shared per-primitive extraction `mesh-primitives-by-
+  name`/`mesh-geometry-by-name` both build on)."
+  [vdoc prim]
+  (let [{:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0 TEXCOORD_0]} (:attributes prim)]
+    (cond-> {:positions (accessor->vec3s vdoc POSITION)
+             :normals (accessor->vec3s vdoc NORMAL)
+             :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))
+             :material (:material prim)}
+      JOINTS_0 (assoc :joints (->> (conv/read-accessor-f32 vdoc JOINTS_0) (partition 4) (mapv #(mapv int %))))
+      WEIGHTS_0 (assoc :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec)))
+      TEXCOORD_0 (assoc :uvs (accessor->vec2s vdoc TEXCOORD_0)))))
+
+(defn mesh-primitives-by-name
+  "Like `mesh-geometry-by-name`, but returns a vector of geometry maps — ONE
+  PER PRIMITIVE, not just the first. Real bug fix (/loop maturity pass,
+  ADR-2607031200): every `mesh-*` reader in this namespace used to hardcode
+  `:primitives 0`, silently dropping every other primitive. Every
+  `character-creator`-generated part happens to be single-primitive
+  (`gltf-build/add-part-mesh` always writes exactly one), so this was
+  invisible against this app's own output — but a real parsed VRM (VRoid
+  Studio's standard export shape) commonly gives a `head` mesh 2-3
+  primitives, each with its OWN material (e.g. base skin / eye-white /
+  face-decal texture), so reading only primitive 0 is why a real textured
+  VRM's face rendered with no painted eyes/mouth even after this session's
+  texture-pipeline work landed — confirmed against a real production VRM
+  (local-only test asset, never committed; a hand-built synthetic multi-
+  primitive fixture reproduces the same shape for this namespace's own
+  tests). Returns `[]` if no mesh with that name exists (mirrors
+  `mesh-geometry-by-name`'s `nil`-for-missing convention)."
+  [vdoc mesh-name]
+  (let [meshes (get-in vdoc [:gltf :meshes])
+        mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
+    (if-not mesh-idx
+      []
+      (mapv #(primitive->geometry vdoc %) (get-in vdoc [:gltf :meshes mesh-idx :primitives])))))
+
 (defn mesh-geometry-by-name
   "Like `mesh-geometry`, but resolves the mesh by its `character/generate-
   character` part `:name` (`\"body\"`/`\"hair\"`/`\"clothing\"`/...) instead of
@@ -67,35 +105,42 @@
   maturity pass' texture work (`character-creator's` own generated parts
   already write `TEXCOORD_0` via `gltf-build/add-part-mesh`, but nothing
   read it back out until now; a real parsed VRM like VRoid Studio output
-  always carries it on painted meshes)."
+  always carries it on painted meshes).
+
+  Now a thin wrapper (/loop maturity pass) over `mesh-primitives-by-name`,
+  returning only the FIRST primitive — backward-compatible for every
+  existing caller, which (correctly, for character-creator's own single-
+  primitive generated parts) never needed more than one. A real multi-
+  primitive mesh (e.g. a parsed VRoid Studio VRM's head) needs
+  `mesh-primitives-by-name` instead to see every primitive, not just this
+  one."
   [vdoc mesh-name]
-  (let [meshes (get-in vdoc [:gltf :meshes])
-        mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
-    (when mesh-idx
-      (let [prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])
-            {:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0 TEXCOORD_0]} (:attributes prim)]
-        (cond-> {:positions (accessor->vec3s vdoc POSITION)
-                 :normals (accessor->vec3s vdoc NORMAL)
-                 :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))
-                 :material (:material prim)}
-          JOINTS_0 (assoc :joints (->> (conv/read-accessor-f32 vdoc JOINTS_0) (partition 4) (mapv #(mapv int %))))
-          WEIGHTS_0 (assoc :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec)))
-          TEXCOORD_0 (assoc :uvs (accessor->vec2s vdoc TEXCOORD_0)))))))
+  (first (mesh-primitives-by-name vdoc mesh-name)))
+
+(defn material-base-color-texture
+  "`material-idx` -> `{:bytes :mime-type}` (see `vrm.convert/read-base-
+  color-texture`), or `nil` if `material-idx` is `nil` or that material has
+  no embedded baseColorTexture. Takes the index directly (not a mesh name)
+  so a caller iterating `mesh-primitives-by-name`'s results can resolve
+  each PRIMITIVE's own material — `mesh-base-color-texture`, below, only
+  ever resolved a mesh's first-primitive material, the same primitive-0
+  blind spot `mesh-geometry-by-name` had."
+  [vdoc material-idx]
+  (when material-idx
+    (conv/read-base-color-texture vdoc material-idx)))
 
 (defn mesh-base-color-texture
-  "`mesh-name`'s sole primitive's material -> `{:bytes :mime-type}` (see
+  "`mesh-name`'s FIRST primitive's material -> `{:bytes :mime-type}` (see
   `vrm.convert/read-base-color-texture`), or `nil` if the mesh doesn't
   exist, has no material, or that material has no embedded baseColorTexture
   (e.g. every procedurally-generated character-creator part today — this
   is meaningful against a real parsed VRM like VRoid Studio output, which
-  paints faces via a texture)."
+  paints faces via a texture). Kept for backward compatibility (every
+  existing caller only ever dealt with single-primitive meshes); for a
+  multi-primitive mesh, resolve each primitive's own texture via
+  `mesh-primitives-by-name` + `material-base-color-texture` instead."
   [vdoc mesh-name]
-  (let [meshes (get-in vdoc [:gltf :meshes])
-        mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
-    (when mesh-idx
-      (let [prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])]
-        (when-let [mat-idx (:material prim)]
-          (conv/read-base-color-texture vdoc mat-idx))))))
+  (material-base-color-texture vdoc (:material (mesh-geometry-by-name vdoc mesh-name))))
 
 (defn body-mesh-geometry
   "`\"body\"`'s sole primitive -> `{:positions :normals :indices :joints
