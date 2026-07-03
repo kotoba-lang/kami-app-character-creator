@@ -14,4 +14,13 @@
            :cljs {:extra-paths ["dev"]
                   :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
                                io.github.kotoba-lang/webgpu {:local/root "../webgpu"}}
-                  :main-opts ["-m" "cljs.main" "-co" "dev/build.edn" "-c" "character-creator.preview-demo"]}}}
+                  :main-opts ["-m" "cljs.main" "-co" "dev/build.edn" "-c" "character-creator.preview-demo"]}
+           ;; /loop maturity pass — the real interactive character-creation screen
+           ;; (`app.html`/`character-creator.app`), same dev-only shape as `:cljs`
+           ;; above plus `kami-ui-sdk` (`kami-ui-sdk.widgets`'s real DOM slider/
+           ;; color-swatch/carousel).
+           :cljs-app {:extra-paths ["dev"]
+                      :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
+                                   io.github.kotoba-lang/webgpu {:local/root "../webgpu"}
+                                   io.github.kotoba-lang/kami-ui-sdk {:local/root "../kami-ui-sdk"}}
+                      :main-opts ["-m" "cljs.main" "-co" "dev/app-build.edn" "-c" "character-creator.app"]}}}

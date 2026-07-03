@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>kami-app-character-creator</title>
+<style>
+  body { background: #f0ead6; color: #2d3436; font-family: 'Nunito', system-ui, -apple-system, sans-serif; margin: 0; padding: 16px; }
+  #app { display: flex; gap: 20px; align-items: flex-start; }
+  #gpu-canvas { width: 560px; height: 480px; display: block; background: #000; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+  #controls { width: 300px; display: flex; flex-direction: column; gap: 10px; }
+  #status { padding: 8px 0; font-size: 13px; font-weight: 800; }
+</style>
+</head>
+<body>
+<h3>kami-app-character-creator — ADR-2607031200 /loop maturity pass</h3>
+<p style="max-width:880px;color:#636e72;font-size:13px">
+  The real interactive character-creation screen: drag a body/face slider, pick a
+  skin/hair/eye color, page the hair-style carousel, or click an expression preset —
+  the live-rendered avatar (left: head with real blendshapes, right: skinned body)
+  updates immediately. Click "Download .vrm" to export what you made. Auto-cycling
+  regression demo of the same underlying pipeline: <a href="preview-demo.html">preview-demo.html</a>.
+</p>
+<div id="status">loading…</div>
+<div id="app">
+  <canvas id="gpu-canvas"></canvas>
+  <div id="controls"></div>
+</div>
+<script src="dev/out-app/app.js"></script>
+</body>
+</html>
