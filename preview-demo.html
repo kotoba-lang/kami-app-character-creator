@@ -10,16 +10,14 @@
 </style>
 </head>
 <body>
-<h3>ADR-2607031200 Phase 2 — left: real character-creator head mesh (3185 real vertices) with a synthetic "puff" morph target animating (see note); right: synthetic 2-bone skinned strip bending</h3>
+<h3>ADR-2607031200 Phase 2 — left: real character-creator head mesh (3185 real vertices) crossfading through REAL VRM expression presets; right: synthetic 2-bone skinned strip bending</h3>
 <p style="max-width:900px;color:#aaa;font-size:13px">
-  Note: <code>character.blendshape/generate-arkit-targets</code> is a documented placeholder in
-  <code>kotoba-lang/character</code> — all 52 real ARKit morph deltas are <code>[0 0 0]</code> today
-  ("zero placeholder — populated from captured data or procedural rules"), confirmed by injecting a
-  weight=8.0 test and diffing screenshots (byte-identical to weight=0). The head mesh's geometry,
-  glTF morph-target wiring, and this page's WebGPU skin/morph shader are all real; target 0's delta is
-  substituted here with a synthetic per-vertex "puff along normal" so the shader path has something
-  non-zero to blend — content authoring for real ARKit deltas is separate, future work on
-  <code>character.blendshape</code> itself.
+  <code>character.blendshape/generate-arkit-targets</code> now computes real per-vertex deltas
+  (procedural region falloffs, not captured scan data — see that namespace's <code>targets-spec</code>)
+  for the 32 ARKit targets <code>character-creator.expression-bridge</code> references, covering every
+  VRM 1.0 preset. This page cycles through <code>neutral → happy → surprised → angry → sad</code> using
+  the real <code>character-creator.gpu-adapter/preset-weight-vector</code> weights, crossfading linearly
+  between adjacent presets.
 </p>
 <div id="status">loading…</div>
 <canvas id="gpu-canvas"></canvas>
