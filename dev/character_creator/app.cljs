@@ -33,7 +33,8 @@
             [kami-ui-sdk.widgets :as w]
             [kami-ui-sdk.ui :as ui]
             [vrm.parse :as vparse]
-            [vrm.expression :as vexpr]))
+            [vrm.expression :as vexpr]
+            [vrm.spring :as vspring]))
 
 ;; ─── state ──────────────────────────────────────────────────────────────
 
@@ -65,13 +66,29 @@
 
 (defonce !uploaded (atom nil))
 ;; nil, or {:vdoc :status ("loading"/"ready"/"error: ...") :meshes [{:mesh-idx
-;;  :primitives [{:buffers :material :joint-count}]}] :fit {:center :scale}
-;;  :expr-mgr :expr-names :active-expr}. :textures is a SEPARATE atom (below)
-;; since texture decode is async and must not block the rest of this map.
+;;  :skin-idx :primitives [{:buffers :material :joint-count}]}] :fit
+;;  {:center :scale} :expr-mgr :expr-names :active-expr :spring-sim
+;;  :spring-overrides}. :textures is a SEPARATE atom (below) since texture
+;; decode is async and must not block the rest of this map.
+;;
+;; :skin-idx (spring-bone follow-up, /loop maturity pass): which glTF `skins`
+;; entry (if any) this mesh's node references — resolved once at load time
+;; via `gpu/mesh-node`, not per-frame. :spring-sim/:spring-overrides drive
+;; real jiggle physics instead of the all-identity joint palette this render
+;; path used before: :spring-sim is `vrm.spring/new-simulator`'s threaded
+;; state (nil if the uploaded model has no spring bones at all — most VRMs
+;; do, per VRMC_springBone, but it's optional); :spring-overrides is the
+;; PREVIOUS frame's `vrm.spring/step` output, reduced to a `{node-idx quat}`
+;; map — `vrm.spring/step`'s own docstring: the node-world it's given should
+;; reflect the previous frame's spring-posed world (rest pose on frame 0),
+;; so the cascade carries forward frame-to-frame with one frame of latency,
+;; matching the original Rust behaviour.
 (defonce !uploaded-textures (atom {})) ;; [mesh-idx prim-idx] -> GPUTexture, filled in as each
                                         ;; upload-texture! promise resolves (render loop just
                                         ;; reads whatever's there each frame -- nil = draw with
                                         ;; kami.webgpu.mesh's own default-white fallback)
+(defonce !last-frame-time (atom nil))  ;; performance.now() of the previous rAF tick, for a real
+                                        ;; dt feeding vrm.spring/step (nil on the very first frame)
 
 (defn- log [& xs] (.apply (.-log js/console) js/console (clj->js xs)))
 
@@ -398,7 +415,8 @@
 
 (defn clear-uploaded! []
   (reset! !uploaded nil)
-  (reset! !uploaded-textures {}))
+  (reset! !uploaded-textures {})
+  (reset! !last-frame-time nil))
 
 (defn load-vrm-file!
   "`file`: a real `js/File` from a `<input type=file>` change event (or an
@@ -434,6 +452,11 @@
                   (mapv
                     (fn [mesh-idx prims]
                       {:mesh-idx mesh-idx
+                       ;; spring-bone follow-up: resolved ONCE here (glTF nodes point AT a
+                       ;; mesh, so this is a lookup, not a per-frame cost) — nil for an
+                       ;; unskinned mesh, in which case the render loop keeps the old
+                       ;; identity-palette behaviour for it.
+                       :skin-idx (:skin (gpu/mesh-node vdoc mesh-idx))
                        :primitives
                        (mapv
                          (fn [prim-idx {:keys [positions normals indices uvs joints weights material]}]
@@ -445,12 +468,18 @@
                          (range (count prims)) prims)})
                     (range n-meshes) primitives-by-mesh)
                   expr-mgr (vexpr/new-manager (:expressions vdoc))
-                  expr-names (mapv :name (:expressions vdoc))]
+                  expr-names (mapv :name (:expressions vdoc))
+                  spring-bones (:spring-bones vdoc)
+                  spring-sim (when (seq spring-bones) (vspring/new-simulator vdoc))]
               (reset! !uploaded-textures {})
+              (reset! !last-frame-time nil)
               (reset! !uploaded {:vdoc vdoc :status "ready" :meshes meshes :fit fit
                                   :expr-mgr expr-mgr :expr-names expr-names
-                                  :active-expr (first expr-names)})
-              (log "uploaded VRM ready —" n-meshes "meshes," (count expr-names) "expressions"))
+                                  :active-expr (first expr-names)
+                                  :spring-sim spring-sim :spring-overrides {}})
+              (log "uploaded VRM ready —" n-meshes "meshes," (count expr-names) "expressions,"
+                   (count spring-bones) "spring-bone chains")
+              (set! (.-__kami_cc_uploaded_spring_chains js/window) (count spring-bones)))
             (catch :default err
               (reset! !uploaded {:status (str "error: " err)})
               (log "uploaded VRM parse failed:" err)))))
@@ -682,7 +711,35 @@
                          ;; procedural character. Single shared camera/MVP (the whole
                          ;; model was bbox-fit together in load-vrm-file!, not split
                          ;; into head/body "portraits" the way the procedural path is).
-                         (let [vp (mesh/view-projection [0 0.15 2.6] [0 0 0] (/ w (max 1 h)))
+                         ;;
+                         ;; Spring-bone follow-up (/loop maturity pass): a real dt
+                         ;; (performance.now() delta, ~1/60s on the very first frame,
+                         ;; before !last-frame-time has a prior value) drives
+                         ;; vrm.spring/step every tick. Per that fn's own docstring,
+                         ;; the `node-world` it's given should reflect the PREVIOUS
+                         ;; frame's spring-posed world (rest pose on frame 0) so the
+                         ;; cascade carries forward with one frame of latency, same as
+                         ;; the original Rust; its output overrides are what THIS
+                         ;; frame actually renders with (and what next frame's node-
+                         ;; world will reflect). Non-spring joints are untouched —
+                         ;; still driven by their own rest rotation via
+                         ;; node-world-transforms, same as before this pass.
+                         (let [now (js/performance.now)
+                               dt (if-let [last @!last-frame-time]
+                                    (min (/ 1.0 20.0) (max 0.0 (/ (- now last) 1000.0)))
+                                    (/ 1.0 60.0))
+                               _ (reset! !last-frame-time now)
+                               vdoc (:vdoc u)
+                               node-world-for-step (gpu/node-world-transforms vdoc (:spring-overrides u))
+                               [new-sim step-overrides]
+                               (if-let [sim (:spring-sim u)]
+                                 (vspring/step sim dt node-world-for-step)
+                                 [nil []])
+                               overrides-map (into {} step-overrides)
+                               _ (when (:spring-sim u)
+                                   (swap! !uploaded assoc :spring-sim new-sim :spring-overrides overrides-map))
+                               final-node-world (gpu/node-world-transforms vdoc overrides-map)
+                               vp (mesh/view-projection [0 0.15 2.6] [0 0 0] (/ w (max 1 h)))
                                weights (when-let [mgr (:expr-mgr u)]
                                          (:morphs (vexpr/resolve-expression mgr {(:active-expr u) 1.0})))
                                enc (.createCommandEncoder device)
@@ -692,14 +749,16 @@
                                                                        :clearValue #js {:r 0.94 :g 0.92 :b 0.86 :a 1}}]
                                            :depthStencilAttachment #js {:view (.createView depth-tex) :depthLoadOp "clear"
                                                                         :depthStoreOp "store" :depthClearValue 1.0}})]
-                           (doseq [{:keys [mesh-idx primitives]} (:meshes u)]
+                           (doseq [{:keys [mesh-idx skin-idx primitives]} (:meshes u)]
                              (doseq [[prim-idx {:keys [buffers]}] (map-indexed vector primitives)]
                                (let [morph-count (:morph-count buffers)
                                      morph-weights (if (pos? morph-count)
                                                      (uploaded-morph-weights mesh-idx morph-count weights)
                                                      [])
                                      joint-count (:joint-count buffers)
-                                     joints (vec (repeat joint-count (identity-mat4)))
+                                     joints (if (and skin-idx (pos? joint-count))
+                                              (gpu/skin-joint-palette vdoc skin-idx final-node-world)
+                                              (vec (repeat joint-count (identity-mat4))))
                                      tex (get @!uploaded-textures [mesh-idx prim-idx])]
                                  (mesh/draw! mctx pass buffers vp [1.0 1.0 1.0] morph-weights joints
                                              (when tex {:texture tex})))))
