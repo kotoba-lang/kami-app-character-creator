@@ -1,0 +1,127 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>verify save/load/randomize</title>
+<style>
+  body { background: #f0ead6; color: #2d3436; font-family: sans-serif; margin: 0; padding: 16px; }
+  #app { display: flex; gap: 20px; align-items: flex-start; }
+  #gpu-canvas { width: 560px; height: 480px; display: block; background: #000; }
+  #controls { width: 300px; display: flex; flex-direction: column; gap: 10px; }
+  #status { padding: 8px 0; font-size: 13px; font-weight: 800; }
+  #results { white-space: pre; font-family: monospace; font-size: 12px; background: #fff; padding: 8px; }
+</style>
+</head>
+<body>
+<div id="status">loading…</div>
+<div id="app">
+  <canvas id="gpu-canvas"></canvas>
+  <div id="controls"></div>
+</div>
+<div id="results">pending…</div>
+<script src="dev/out-app/app.js"></script>
+<script>
+function log(line) {
+  var el = document.getElementById('results');
+  el.textContent += line + "\n";
+  console.log('[verify-persistence]', line);
+}
+function waitFor(pred, timeoutMs, cb) {
+  var start = Date.now();
+  (function poll() {
+    if (pred()) return cb(true);
+    if (Date.now() - start > timeoutMs) return cb(false);
+    setTimeout(poll, 100);
+  })();
+}
+function fireClick(el) {
+  el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+  el.click();
+}
+function heightSliderValueText() {
+  var row = document.querySelector('[data-testid="slider-height"]');
+  var spans = row.querySelectorAll('span');
+  return spans.length ? spans[spans.length - 1].textContent : null;
+}
+function canvasHash() {
+  var c = document.getElementById('gpu-canvas');
+  return c.toDataURL().length + ':' + c.toDataURL().slice(-200);
+}
+
+waitFor(function () { return window.__kami_cc_ready === true; }, 15000, function (ready) {
+  if (!ready) { log('FAIL: app never became ready'); return; }
+  log('app ready. initial height=' + heightSliderValueText());
+  var hash0 = canvasHash();
+  var slider0 = heightSliderValueText();
+
+  var randomizeBtn = document.querySelector('[data-testid="randomize-btn"]');
+  var saveBtn = document.querySelector('[data-testid="save-btn"]');
+  var loadBtn = document.querySelector('[data-testid="load-btn"]');
+  var exportBtn = document.querySelector('[data-testid="export-btn"]');
+  var exportEdnBtn = document.querySelector('[data-testid="export-edn-btn"]');
+
+  // 1) Randomize twice, confirm each click visibly changes both the slider
+  //    DOM value and the render.
+  fireClick(randomizeBtn);
+  setTimeout(function () {
+    var hash1 = canvasHash(), slider1 = heightSliderValueText();
+    var r1_hash_diff = (hash1 !== hash0);
+    var r1_slider_diff = (slider1 !== slider0);
+    log('after randomize#1: height=' + slider1 + ' hashDiff=' + r1_hash_diff + ' sliderDiff=' + r1_slider_diff);
+
+    fireClick(randomizeBtn);
+    setTimeout(function () {
+      var hash2 = canvasHash(), slider2 = heightSliderValueText();
+      var r2_hash_diff = (hash2 !== hash1);
+      var r2_slider_diff = (slider2 !== slider1);
+      log('after randomize#2: height=' + slider2 + ' hashDiff=' + r2_hash_diff + ' sliderDiff=' + r2_slider_diff);
+
+      // 2) Save the current (randomize#2) state, then randomize again to
+      //    change it away, then Load — should revert to the randomize#2
+      //    state (hash2/slider2), not the randomize#3 state.
+      fireClick(saveBtn);
+      log('saved. id=' + window.__kami_cc_last_save);
+
+      fireClick(randomizeBtn);
+      setTimeout(function () {
+        var hash3 = canvasHash(), slider3 = heightSliderValueText();
+        log('after randomize#3 (pre-load, should differ from #2): height=' + slider3);
+
+        fireClick(loadBtn);
+        setTimeout(function () {
+          var hashL = canvasHash(), sliderL = heightSliderValueText();
+          // NOTE: comparing sliderL (a real CharacterDoc field) not hashL
+          // (the full canvas) against the saved state — the canvas also
+          // reflects !active-preset (expression preview), which is
+          // deliberately NOT part of the persisted CharacterDoc, so a
+          // stray randomize#3 expression change legitimately survives
+          // Load and makes a full-hash comparison a false negative.
+          var load_matches_saved = (sliderL === slider2);
+          var load_differs_from_pre_load = (hashL !== hash3);
+          log('after load: height=' + sliderL + ' matchesSavedState=' + load_matches_saved +
+              ' differsFromPreLoadState=' + load_differs_from_pre_load);
+
+          // 3) Export buttons — confirm the download-trigger flags this
+          //    code already sets get flipped (a real Blob/ObjectURL/<a
+          //    download> click happened, not just a no-op).
+          fireClick(exportBtn);
+          fireClick(exportEdnBtn);
+          setTimeout(function () {
+            log('exported .vrm=' + window.__kami_cc_exported + ' exported .edn=' + window.__kami_cc_exported_edn);
+
+            var pass =
+              r1_hash_diff && r1_slider_diff &&
+              r2_hash_diff && r2_slider_diff &&
+              load_matches_saved && load_differs_from_pre_load &&
+              window.__kami_cc_exported === true &&
+              window.__kami_cc_exported_edn === true;
+            log(pass ? 'ALL PASS' : 'SOME FAILED');
+          }, 300);
+        }, 300);
+      }, 300);
+    }, 300);
+  }, 300);
+});
+</script>
+</body>
+</html>
