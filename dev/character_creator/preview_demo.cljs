@@ -1,11 +1,20 @@
 (ns character-creator.preview-demo
   "Phase 2 (ADR-2607031200) browser proof: a real character-creator head mesh
-  morphing between VRM expressions, and a synthetic 2-bone skinned strip
-  bending — both drawn through `kami.webgpu.mesh` (kotoba-lang/webgpu), the new
-  skin/morph WebGPU executor. Dev-only entry point (`:cljs` alias), not part of
-  the portable pipeline. See `kami.webgpu.mesh`'s docstring for why this is a
-  new sibling executor rather than a `kami.webgpu.cljs` edit, and why skinning
-  is demoed on a synthetic fixture rather than a real avatar."
+  morphing between REAL VRM expression presets, and a synthetic 2-bone skinned
+  strip bending — both drawn through `kami.webgpu.mesh` (kotoba-lang/webgpu),
+  the skin/morph WebGPU executor. Dev-only entry point (`:cljs` alias), not
+  part of the portable pipeline. See `kami.webgpu.mesh`'s docstring for why
+  this is a new sibling executor rather than a `kami.webgpu.cljs` edit, and
+  why skinning is demoed on a synthetic fixture rather than a real avatar.
+
+  Maturity-loop update (`character.blendshape/generate-arkit-targets` no
+  longer returns all-zero deltas for the 32 ARKit targets `character-
+  creator.expression-bridge/preset->arkit-weights` references — see that
+  namespace's `targets-spec`): this demo now cycles through REAL VRM preset
+  weight vectors (`character-creator.gpu-adapter/preset-weight-vector`)
+  instead of the earlier synthetic single-target 'puff along normal'
+  substitution that namespace used only to prove the render *path* while
+  `character.blendshape` was still a placeholder."
   (:require [character-creator.doc :as doc]
             [character-creator.pipeline :as pipeline]
             [character-creator.gpu-adapter :as gpu]
@@ -106,25 +115,19 @@
                                                            :usage (.-RENDER_ATTACHMENT js/GPUTextureUsage)})
                     mctx (mesh/init! device fmt)
 
-                    ;; --- real character-creator head mesh (real geometry; SYNTHETIC morph
-                    ;; delta — see below) ---
+                    ;; --- real character-creator head mesh, REAL morph deltas ---
+                    ;; `character.blendshape/generate-arkit-targets` now computes real
+                    ;; per-vertex deltas for the 32 ARKit targets the expression bridge
+                    ;; references (procedural region falloffs — see that namespace's
+                    ;; `targets-spec`), so no synthetic substitution is needed any more.
                     vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
                     geo (gpu/head-mesh-geometry vdoc)
                     fit (bbox-fit (:positions geo))
-                    ;; FINDING (not a Phase 2 bug — verified at the character.blendshape source):
-                    ;; character.blendshape/generate-arkit-targets is a documented placeholder —
-                    ;; "zero placeholder — populated from captured data or procedural rules" — so
-                    ;; ALL 52 ARKit targets are all-[0 0 0] for every CharacterDef today. Confirmed
-                    ;; by injecting a synthetic weight=8.0 on target 0 and diffing screenshots
-                    ;; (byte-identical to weight=0). The glTF-morph-target *plumbing* (gltf-build's
-                    ;; writer, gpu-adapter's reader, kami.webgpu.mesh's storage-buffer blend shader)
-                    ;; is real and correct — proven below by substituting one SYNTHETIC "puff along
-                    ;; normal" delta for real target 0, since character.blendshape can't supply a
-                    ;; non-zero one yet. character.blendshape itself is untouched (content-authoring
-                    ;; work, not a bug fix, is out of this ADR's scope).
-                    synthetic-puff (mapv (fn [[nx ny nz]] [(* nx 0.35) (* ny 0.35) (* nz 0.35)]) (:normals geo))
-                    morph-deltas (assoc (vec (fit-deltas (:morph-target-deltas geo) (:scale fit)))
-                                        0 synthetic-puff)
+                    morph-deltas (vec (fit-deltas (:morph-target-deltas geo) (:scale fit)))
+                    presets [:neutral :happy :surprised :angry :sad]
+                    preset-weights (mapv #(gpu/preset-weight-vector
+                                            bridge/preset->arkit-weights (:morph-target-names geo) %)
+                                          presets)
                     head-buffers (mesh/upload-mesh!
                                    mctx {:positions (fit-positions (:positions geo) fit)
                                          :normals (:normals geo)
@@ -136,6 +139,7 @@
                     arm-buffers (mesh/upload-mesh! mctx arm-geo)]
                 (log "head mesh vertices:" (count (:positions geo)) "morph targets:" (count (:morph-target-deltas geo)))
                 (log "arm mesh vertices:" (count (:positions arm-geo)))
+                (log "cycling real VRM presets:" (pr-str presets))
                 (set! (.-innerText (js/document.getElementById "status")) "WebGPU OK — rendering.")
                 ((fn tick [t0]
                    (js/requestAnimationFrame
@@ -144,10 +148,14 @@
                              vp (mesh/view-projection [0 0.3 2.6] [0 0 0] (/ w (max 1 h)))
                              head-mvp (m4-mul vp (model-translate [-0.8 0 0]))
                              arm-mvp (m4-mul vp (model-translate [0.3 -0.2 0]))
-                             ;; index-0 target is the synthetic puff (see above); oscillate its
-                             ;; weight 0..1 so the morph is visibly animated, not just present.
-                             puff-w (max 0.0 (js/Math.sin (* tt 1.1)))
-                             weights (assoc (vec (repeat (count (:morph-target-names geo)) 0.0)) 0 puff-w)
+                             ;; cycle through real VRM expression presets, 1.5s each, crossfading
+                             ;; linearly between adjacent presets' real weight vectors so the morph
+                             ;; is visibly animated (not a static pose swap).
+                             n (count presets)
+                             cycle-t (mod (/ tt 1.5) n)
+                             i0 (int cycle-t) i1 (mod (inc i0) n) f (- cycle-t i0)
+                             w0 (nth preset-weights i0) w1 (nth preset-weights i1)
+                             weights (mapv (fn [a b] (+ (* a (- 1.0 f)) (* b f))) w0 w1)
                              theta (* 0.8 (js/Math.sin (* tt 1.3)))
                              joints (arm-joint-matrices theta)
                              enc (.createCommandEncoder device)
@@ -156,7 +164,11 @@
                                     #js {:colorAttachments #js [#js {:view view :loadOp "clear" :storeOp "store"
                                                                      :clearValue #js {:r 0.08 :g 0.08 :b 0.1 :a 1}}]
                                          :depthStencilAttachment #js {:view (.createView depth-tex) :depthLoadOp "clear"
-                                                                      :depthStoreOp "store" :depthClearValue 1.0}})]
+                                                                      :depthStoreOp "store" :depthClearValue 1.0}})
+                             current-preset (name (nth presets i0))]
+                         (set! (.-innerText (js/document.getElementById "status"))
+                               (str "WebGPU OK — preset: " current-preset " -> " (name (nth presets i1)) " (" (.toFixed f 2) ")"))
+                         (set! (.-__kami_cc_preset js/window) current-preset)
                          (mesh/draw! mctx pass head-buffers head-mvp [0.85 0.75 0.65] weights [])
                          (mesh/draw! mctx pass arm-buffers arm-mvp [0.6 0.8 0.95] [] joints)
                          (.end pass)
