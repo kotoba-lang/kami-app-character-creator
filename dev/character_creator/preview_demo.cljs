@@ -10,6 +10,7 @@
             [character-creator.pipeline :as pipeline]
             [character-creator.gpu-adapter :as gpu]
             [character-creator.expression-bridge :as bridge]
+            [character.body :as cbody]
             [kami.webgpu.mesh :as mesh]))
 
 ;; --- bounding-box fit: normalize the real head mesh into a unit-ish cube so
@@ -28,6 +29,35 @@
 
 (defn- fit-deltas [deltas scale]
   (mapv (fn [target] (mapv (fn [d] (mapv #(* % scale) d)) target)) deltas))
+
+(defn- fit-point [[x y z] {:keys [center scale]}]
+  (mapv (fn [pi ci] (* (- pi ci) scale)) [x y z] center))
+
+;; --- real character-creator BODY mesh, real skin weights (/loop maturity
+;; pass, ADR-2607031200 — Phase 2 predates this and had no skinned real-
+;; avatar geometry, so it only proved skinning on the synthetic arm below).
+;; Pose the "hips" bone (index 0) with a pivot rotation about its own
+;; rest-pose world position and confirm the mesh visibly bends there. ------
+
+(defn- identity-mat4 [] (js/Float32Array. #js [1 0 0 0, 0 1 0 0, 0 0 1 0, 0 0 0 1]))
+
+(defn- pivot-rotate-z
+  "Column-major rotate-about-Z mat4 with the rotation centered on `[px py pz]`
+  (derived directly, not copied from `arm-joint-matrices` below — that one
+  demos fine visually but its translation term's y-sign doesn't reduce to
+  identity at theta=0 the way this one's does, so it isn't reused here)."
+  [[px py _pz] theta]
+  (let [c (js/Math.cos theta) s (js/Math.sin theta)
+        rx (- (* c px) (* s py))
+        ry (+ (* s px) (* c py))]
+    (js/Float32Array. #js [c s 0 0, (- s) c 0 0, 0 0 1 0, (- px rx) (- py ry) 0 1])))
+
+(defn- body-joint-matrices
+  "13-length joint palette: identity everywhere except `hips` (bone index 0),
+  which gets `pivot-rotate-z` around its own rest-pose world position."
+  [bone-world-pos theta]
+  (mapv (fn [i bp] (if (zero? i) (pivot-rotate-z bp theta) (identity-mat4)))
+        (range (count bone-world-pos)) bone-world-pos))
 
 ;; --- synthetic 2-bone bending strip (skinning proof — Phase 1's real avatar
 ;; has no JOINTS_0/WEIGHTS_0, per character.body's documented limitation) ----
@@ -131,25 +161,46 @@
                                          :indices (:indices geo)
                                          :morph-target-deltas morph-deltas})
 
-                    ;; --- synthetic 2-bone arm (skinning proof) ---
+                    ;; --- synthetic 2-bone arm (skinning proof on a fixture) ---
                     arm-geo (synthetic-arm)
-                    arm-buffers (mesh/upload-mesh! mctx arm-geo)]
+                    arm-buffers (mesh/upload-mesh! mctx arm-geo)
+
+                    ;; --- real character-creator BODY mesh, real skin weights ---
+                    body-geo (gpu/body-mesh-geometry vdoc)
+                    body-fit (bbox-fit (:positions body-geo))
+                    skeleton (cbody/generate-humanoid-skeleton)
+                    bone-world-pos-raw (cbody/bone-world-positions (:bones skeleton))
+                    bone-world-pos (mapv #(fit-point % body-fit) bone-world-pos-raw)
+                    body-buffers (mesh/upload-mesh!
+                                   mctx {:positions (fit-positions (:positions body-geo) body-fit)
+                                         :normals (:normals body-geo)
+                                         :indices (:indices body-geo)
+                                         :joints (:joints body-geo)
+                                         :weights (:weights body-geo)})]
                 (log "head mesh vertices:" (count (:positions geo)) "morph targets:" (count (:morph-target-deltas geo)))
                 (log "arm mesh vertices:" (count (:positions arm-geo)))
+                (log "body mesh vertices:" (count (:positions body-geo)) "bones:" (count bone-world-pos))
                 (set! (.-innerText (js/document.getElementById "status")) "WebGPU OK — rendering.")
                 ((fn tick [t0]
                    (js/requestAnimationFrame
                      (fn [t]
                        (let [tt (/ t 1000.0)
                              vp (mesh/view-projection [0 0.3 2.6] [0 0 0] (/ w (max 1 h)))
-                             head-mvp (m4-mul vp (model-translate [-0.8 0 0]))
-                             arm-mvp (m4-mul vp (model-translate [0.3 -0.2 0]))
+                             head-mvp (m4-mul vp (model-translate [-1.1 0 0]))
+                             arm-mvp (m4-mul vp (model-translate [0.0 -0.2 0]))
+                             body-mvp (m4-mul vp (model-translate [1.1 0.15 0]))
                              ;; index-0 target is the synthetic puff (see above); oscillate its
                              ;; weight 0..1 so the morph is visibly animated, not just present.
                              puff-w (max 0.0 (js/Math.sin (* tt 1.1)))
                              weights (assoc (vec (repeat (count (:morph-target-names geo)) 0.0)) 0 puff-w)
                              theta (* 0.8 (js/Math.sin (* tt 1.3)))
                              joints (arm-joint-matrices theta)
+                             ;; `window.__hipsTheta` (default an oscillation) lets headless-Chrome
+                             ;; verification pin an exact bend angle instead of racing requestAnimationFrame.
+                             body-theta (if (some? (.-__hipsTheta js/window))
+                                          (.-__hipsTheta js/window)
+                                          (* 0.6 (js/Math.sin (* tt 0.9))))
+                             body-joints (body-joint-matrices bone-world-pos body-theta)
                              enc (.createCommandEncoder device)
                              view (.createView (.getCurrentTexture ctx))
                              pass (.beginRenderPass enc
@@ -159,6 +210,7 @@
                                                                       :depthStoreOp "store" :depthClearValue 1.0}})]
                          (mesh/draw! mctx pass head-buffers head-mvp [0.85 0.75 0.65] weights [])
                          (mesh/draw! mctx pass arm-buffers arm-mvp [0.6 0.8 0.95] [] joints)
+                         (mesh/draw! mctx pass body-buffers body-mvp [0.95 0.55 0.55] [] body-joints)
                          (.end pass)
                          (.submit (.-queue device) #js [(.finish enc)])
                          (tick t)))))

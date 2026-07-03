@@ -27,3 +27,13 @@
       (is (pos? (count (filter pos? w))))
       (let [blink-idx (first (keep-indexed #(when (= %2 "eyeBlinkLeft") %1) (:morph-target-names geo)))]
         (is (= 0.0 (nth w blink-idx)))))))
+
+(deftest body-mesh-geometry-shape-test
+  (testing "decodes real positions/normals/indices/JOINTS_0/WEIGHTS_0 off the skinned body mesh"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          geo (gpu/body-mesh-geometry vdoc)]
+      (is (pos? (count (:positions geo))))
+      (is (= (count (:positions geo)) (count (:joints geo)) (count (:weights geo))))
+      (is (every? #(= 4 (count %)) (:joints geo)))
+      (is (every? #(= 4 (count %)) (:weights geo)))
+      (is (every? #(< (Math/abs (- (reduce + %) 1.0)) 1e-4) (:weights geo))))))

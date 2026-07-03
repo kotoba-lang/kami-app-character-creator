@@ -20,13 +20,17 @@
   full standing body. A full-body extension is separate follow-up work on
   `character.body` itself, not something this pipeline can add.
 
-  Also Phase 1: exported meshes are unskinned (no `:skins`/JOINTS_0/
-  WEIGHTS_0) — `character.body`'s mesh generators don't attach vertex
-  weights, and computing them is GPU/pose-preview territory the ADR scoped
-  to Phase 2. The humanoid bone *nodes* are still present and mapped via
-  the VRMC_vrm `humanoid` extension, so the document is spec-valid; a
-  viewer just can't pose-deform this mesh yet."
+  Updated (/loop maturity pass): the 'body' part is no longer unskinned —
+  `character.body/skin-body` attaches real `JOINTS_0`/`WEIGHTS_0` (inverse-
+  distance auto-skinning to the rest-pose skeleton, see that namespace's
+  docstring), and this pipeline now writes a real glTF `skins` entry
+  (inverse-bind matrices from `character.body/bone-world-positions`) and
+  references it from the body mesh's node. The 'neck + upper body' bust
+  extent itself (no legs/lower-arms/hands) is still real and unchanged —
+  full-body geometry extrusion is separate follow-up work on
+  `character.body`, not something this pipeline can add."
   (:require [character :as character]
+            [character.body :as cbody]
             [character.material :as cmat]
             [vrm.gltf-types :as gt]
             [vrm.vrm-types :as vt]
@@ -54,17 +58,21 @@
         material-maps (mapv #(cmat/for-part % skin eyes mouth hair clothing) material-ids)
         material-index (zipmap material-ids (range))
         parts (vec (remove #(empty? (:vertices %)) parts))
-        [builder mesh-idxs]
-        (reduce (fn [[b idxs] part]
+        [builder mesh-idxs mesh-names]
+        (reduce (fn [[b idxs names] part]
                   (let [[b mi] (gb/add-part-mesh b part material-index)]
-                    [b (if mi (conj idxs mi) idxs)]))
-                [gb/empty-builder []]
+                    (if mi [b (conj idxs mi) (conj names (:name part))] [b idxs names])))
+                [gb/empty-builder [] []]
                 parts)
         head-mesh-idx (first mesh-idxs)
         builder (gb/add-morph-targets builder head-mesh-idx blendshape-targets)
         bone-nodes (gb/build-bone-nodes skeleton)
         n-bones (count bone-nodes)
-        mesh-nodes (mapv (fn [mi] {:mesh mi}) mesh-idxs)
+        bone-world-pos (cbody/bone-world-positions (:bones skeleton))
+        [builder skin-idx] (gb/add-skin builder (vec (range n-bones)) bone-world-pos)
+        body-mesh-idx (some #(when (= "body" (second %)) (first %)) (map vector mesh-idxs mesh-names))
+        mesh-nodes (mapv (fn [mi] (cond-> {:mesh mi} (= mi body-mesh-idx) (assoc :skin skin-idx)))
+                          mesh-idxs)
         all-nodes (into bone-nodes mesh-nodes)
         scene-node-indices (into [0] (map #(+ n-bones %) (range (count mesh-nodes))))
         human-bones (keep (fn [[i bone]]
@@ -77,6 +85,7 @@
                :scenes [{:nodes scene-node-indices}]
                :nodes all-nodes
                :meshes (:meshes builder)
+               :skins (:skins builder)
                :accessors (:accessors builder)
                :bufferViews (:buffer-views builder)
                :buffers [{:byteLength (count (:bin builder))}]

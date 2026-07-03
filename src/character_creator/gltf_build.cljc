@@ -17,6 +17,8 @@
 
 ;; ── float encode (mirrors vrm/test/vrm_test.cljc's local `f32->bytes`) ──
 
+(defn- u16->le-bytes [n] [(bit-and n 0xFF) (bit-and (bit-shift-right n 8) 0xFF)])
+
 (defn- f32->le-bytes [f]
   (glb/u32->le-bytes
    #?(:clj (Float/floatToIntBits (float f))
@@ -80,13 +82,47 @@
                           :count (count indices) :type "SCALAR"})]
     [(assoc builder :bin bin :buffer-views buffer-views :accessors accessors) acc-idx]))
 
+(defn write-joints-accessor
+  "Append `joint-idx-vecs` (seq of 4-int vectors) as an UNSIGNED_SHORT VEC4
+  accessor (glTF `JOINTS_0` convention). Returns `[builder' acc-idx]`."
+  [builder joint-idx-vecs]
+  (let [bytes (vec (mapcat (fn [v] (mapcat u16->le-bytes v)) joint-idx-vecs))
+        [bin offset] (append-bin (:bin builder) bytes)
+        bv-idx (count (:buffer-views builder))
+        buffer-views (conj (:buffer-views builder)
+                            {:buffer 0 :byteOffset offset :byteLength (count bytes)
+                             :target gt/buffer-target-array-buffer})
+        acc-idx (count (:accessors builder))
+        accessors (conj (:accessors builder)
+                         {:bufferView bv-idx :componentType gt/component-type-unsigned-short
+                          :count (count joint-idx-vecs) :type "VEC4"})]
+    [(assoc builder :bin bin :buffer-views buffer-views :accessors accessors) acc-idx]))
+
+(defn write-mat4-accessor
+  "Append `mats` (seq of 16-float column-major vectors) as a FLOAT MAT4
+  accessor (used for `inverseBindMatrices` — not a vertex attribute, so
+  its bufferView carries no `:target`). Returns `[builder' acc-idx]`."
+  [builder mats]
+  (let [bytes (vec (mapcat (fn [m] (mapcat f32->le-bytes m)) mats))
+        [bin offset] (append-bin (:bin builder) bytes)
+        bv-idx (count (:buffer-views builder))
+        buffer-views (conj (:buffer-views builder)
+                            {:buffer 0 :byteOffset offset :byteLength (count bytes)})
+        acc-idx (count (:accessors builder))
+        accessors (conj (:accessors builder)
+                         {:bufferView bv-idx :componentType gt/component-type-float
+                          :count (count mats) :type "MAT4"})]
+    [(assoc builder :bin bin :buffer-views buffer-views :accessors accessors) acc-idx]))
+
 (defn add-part-mesh
   "Add a `character/generate-character` MeshPart (`{:name :vertices
   [{:position :normal :uv}] :indices :material}`) as a one-primitive glTF
   mesh. `material-index-fn` resolves `:material` (a keyword) to a glTF
   material array index — a plain map works (maps are `IFn` of their keys).
-  Returns `[builder' mesh-idx]`, or `[builder nil]` if the part has no
-  vertices (e.g. the `:bald` hair preset)."
+  If vertices carry `:joint-indices`/`:joint-weights` (`character.body/
+  skin-body`'s output), also writes `JOINTS_0`/`WEIGHTS_0` accessors so the
+  primitive is a real skinned mesh. Returns `[builder' mesh-idx]`, or
+  `[builder nil]` if the part has no vertices (e.g. the `:bald` hair preset)."
   [builder {:keys [name vertices indices material]} material-index-fn]
   (if (empty? vertices)
     [builder nil]
@@ -97,12 +133,37 @@
           [builder norm-acc] (write-vecn-accessor builder normals "VEC3" false)
           [builder uv-acc] (write-vecn-accessor builder uvs "VEC2" false)
           [builder idx-acc] (write-index-accessor builder indices)
+          skinned? (contains? (first vertices) :joint-indices)
+          [builder joints-acc weights-acc]
+          (if skinned?
+            (let [[b ja] (write-joints-accessor builder (mapv :joint-indices vertices))
+                  [b wa] (write-vecn-accessor b (mapv :joint-weights vertices) "VEC4" false)]
+              [b ja wa])
+            [builder nil nil])
+          attrs (cond-> {:POSITION pos-acc :NORMAL norm-acc :TEXCOORD_0 uv-acc}
+                  skinned? (assoc :JOINTS_0 joints-acc :WEIGHTS_0 weights-acc))
           mesh {:name name
-                :primitives [{:attributes {:POSITION pos-acc :NORMAL norm-acc :TEXCOORD_0 uv-acc}
+                :primitives [{:attributes attrs
                               :indices idx-acc
                               :material (material-index-fn material)}]}
           mesh-idx (count (:meshes builder))]
       [(update builder :meshes conj mesh) mesh-idx])))
+
+(defn add-skin
+  "Add a glTF `skins` entry: `joint-node-idxs` (indices into the gltf `nodes`
+  array, index-aligned with the skeleton's bones — as produced by
+  `build-bone-nodes`) + inverse-bind matrices computed from `bone-world-pos`
+  (`character.body/bone-world-positions`' output). Translation-only (matches
+  `generate-humanoid-skeleton`'s identity-rotation rest pose) — a bone's
+  inverse bind matrix is just a translation by its negated world position.
+  Returns `[builder' skin-idx]`."
+  [builder joint-node-idxs bone-world-pos]
+  (let [mat4 (fn [[x y z]] [1.0 0.0 0.0 0.0, 0.0 1.0 0.0 0.0, 0.0 0.0 1.0 0.0, x y z 1.0])
+        ibms (mapv (fn [[x y z]] (mat4 [(- x) (- y) (- z)])) bone-world-pos)
+        [builder ibm-acc] (write-mat4-accessor builder ibms)
+        skin {:joints joint-node-idxs :inverseBindMatrices ibm-acc}
+        skin-idx (count (:skins builder))]
+    [(update builder :skins (fnil conj []) skin) skin-idx]))
 
 (defn add-morph-targets
   "Attach `blendshape-targets` (`character.blendshape/generate-arkit-targets`'

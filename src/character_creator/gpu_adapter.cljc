@@ -44,6 +44,25 @@
   [vdoc]
   (mesh-geometry vdoc 0))
 
+(defn body-mesh-geometry
+  "`\"body\"`'s sole primitive -> `{:positions :normals :indices :joints
+  :weights}` (`:joints`/`:weights` are per-vertex 4-tuples, glTF JOINTS_0/
+  WEIGHTS_0 convention). Real now that `character.body/skin-body` attaches
+  weights and `character-creator.gltf-build/add-part-mesh` writes them
+  (/loop maturity pass, ADR-2607031200) — Phase 2 predates this and had no
+  skinned real-avatar geometry to read. Resolves the mesh by name (not a
+  fixed index) since bald hair etc. can shift mesh indices."
+  [vdoc]
+  (let [meshes (get-in vdoc [:gltf :meshes])
+        mesh-idx (first (keep-indexed (fn [i m] (when (= "body" (:name m)) i)) meshes))
+        prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])
+        {:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0]} (:attributes prim)]
+    {:positions (accessor->vec3s vdoc POSITION)
+     :normals (accessor->vec3s vdoc NORMAL)
+     :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))
+     :joints (->> (conv/read-accessor-f32 vdoc JOINTS_0) (partition 4) (mapv #(mapv int %)))
+     :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec))}))
+
 (defn preset-weight-vector
   "VRM expression preset keyword -> a full weight vector, index-aligned with
   `morph-target-names` (i.e. with `character.blendshape/arkit-names`), for

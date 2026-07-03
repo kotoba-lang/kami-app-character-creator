@@ -53,3 +53,33 @@
       ;; one fewer mesh than the default (no hair mesh: :bald has 0 strands,
       ;; so add-part-mesh skips it per empty-vertices guard)
       (is (= 9 (count (:meshes (:gltf vdoc))))))))
+
+;; ── skinning (/loop maturity pass, ADR-2607031200) ───────────────────────
+
+(deftest body-mesh-is-really-skinned-test
+  (testing "the body mesh's primitive carries JOINTS_0/WEIGHTS_0 and a real :skins entry"
+    (let [d (doc/default-character-doc)
+          vdoc (pipeline/character-doc->vrm-document d)
+          gltf (:gltf vdoc)
+          body-mesh (first (filter #(= "body" (:name %)) (:meshes gltf)))
+          attrs (:attributes (first (:primitives body-mesh)))]
+      (is (some? body-mesh))
+      (is (contains? attrs :JOINTS_0))
+      (is (contains? attrs :WEIGHTS_0))
+      (is (= 1 (count (:skins gltf))))
+      (let [skin (first (:skins gltf))]
+        (is (= 13 (count (:joints skin))))
+        (is (some? (:inverseBindMatrices skin))))
+      ;; the body mesh's node references the skin.
+      (let [mesh-idx (.indexOf (:meshes gltf) body-mesh)
+            node (first (filter #(= mesh-idx (:mesh %)) (:nodes gltf)))]
+        (is (= 0 (:skin node)))))))
+
+(deftest body-mesh-round-trips-skin-through-export-parse-test
+  (testing "vrm/parse-vrm re-reads the exported skin (not just the raw builder state)"
+    (let [d (doc/default-character-doc)
+          bytes (pipeline/character-doc->vrm-bytes d)
+          reparsed (vrm/parse-vrm bytes)
+          gltf (:gltf reparsed)]
+      (is (= 1 (count (:skins gltf))))
+      (is (= 13 (count (:joints (first (:skins gltf)))))))))
