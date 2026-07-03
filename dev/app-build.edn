@@ -1,0 +1,6 @@
+{:main character-creator.app
+ :output-to "dev/out-app/app.js"
+ :output-dir "dev/out-app"
+ :optimizations :simple
+ :target :browser
+ :asset-path "out-app"}

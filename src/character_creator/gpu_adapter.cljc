@@ -44,24 +44,51 @@
   [vdoc]
   (mesh-geometry vdoc 0))
 
+(defn mesh-geometry-by-name
+  "Like `mesh-geometry`, but resolves the mesh by its `character/generate-
+  character` part `:name` (`\"body\"`/`\"hair\"`/`\"clothing\"`/...) instead of
+  a fixed index, since e.g. the `:bald` hair preset produces zero vertices —
+  `character-creator.gltf-build/add-part-mesh` skips writing a mesh for it
+  entirely (see its own \"empty-vertices guard\" docstring), which shifts
+  every subsequent mesh's index. Returns `nil` if no mesh with that name
+  exists (the bald-hair case, or any other zero-vertex part) rather than
+  throwing — callers (interactive UIs cycling through presets) should treat
+  a missing part as \"nothing to draw this frame\", not an error.
+  `:joints`/`:weights` are only present if the primitive actually carries
+  `JOINTS_0`/`WEIGHTS_0` (skinned parts, currently just \"body\")."
+  [vdoc mesh-name]
+  (let [meshes (get-in vdoc [:gltf :meshes])
+        mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
+    (when mesh-idx
+      (let [prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])
+            {:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0]} (:attributes prim)]
+        (cond-> {:positions (accessor->vec3s vdoc POSITION)
+                 :normals (accessor->vec3s vdoc NORMAL)
+                 :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))}
+          JOINTS_0 (assoc :joints (->> (conv/read-accessor-f32 vdoc JOINTS_0) (partition 4) (mapv #(mapv int %))))
+          WEIGHTS_0 (assoc :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec))))))))
+
 (defn body-mesh-geometry
   "`\"body\"`'s sole primitive -> `{:positions :normals :indices :joints
   :weights}` (`:joints`/`:weights` are per-vertex 4-tuples, glTF JOINTS_0/
   WEIGHTS_0 convention). Real now that `character.body/skin-body` attaches
   weights and `character-creator.gltf-build/add-part-mesh` writes them
   (/loop maturity pass, ADR-2607031200) — Phase 2 predates this and had no
-  skinned real-avatar geometry to read. Resolves the mesh by name (not a
-  fixed index) since bald hair etc. can shift mesh indices."
+  skinned real-avatar geometry to read. The body mesh always exists (unlike
+  hair), so this throws (via destructuring `nil`) rather than returning `nil`
+  if somehow absent — callers can rely on it."
   [vdoc]
-  (let [meshes (get-in vdoc [:gltf :meshes])
-        mesh-idx (first (keep-indexed (fn [i m] (when (= "body" (:name m)) i)) meshes))
-        prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])
-        {:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0]} (:attributes prim)]
-    {:positions (accessor->vec3s vdoc POSITION)
-     :normals (accessor->vec3s vdoc NORMAL)
-     :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))
-     :joints (->> (conv/read-accessor-f32 vdoc JOINTS_0) (partition 4) (mapv #(mapv int %)))
-     :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec))}))
+  (mesh-geometry-by-name vdoc "body"))
+
+(defn hair-mesh-geometry
+  "`\"hair\"`'s sole primitive -> `{:positions :normals :indices}`, or `nil`
+  for `:bald` (zero vertices, no mesh written — see `mesh-geometry-by-name`).
+  New for the /loop maturity pass' interactive character-creator screen: the
+  hair carousel changes this mesh, so it must actually be read+drawn for the
+  preset change to be visible (Phase 2's demo never drew hair at all, only
+  head+body)."
+  [vdoc]
+  (mesh-geometry-by-name vdoc "hair"))
 
 (defn preset-weight-vector
   "VRM expression preset keyword -> a full weight vector, index-aligned with

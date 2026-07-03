@@ -1,0 +1,128 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>verify app.html interactivity</title>
+<style>
+  body { background: #f0ead6; color: #2d3436; font-family: sans-serif; margin: 0; padding: 16px; }
+  #app { display: flex; gap: 20px; align-items: flex-start; }
+  #gpu-canvas { width: 560px; height: 480px; display: block; background: #000; }
+  #controls { width: 300px; display: flex; flex-direction: column; gap: 10px; }
+  #status { padding: 8px 0; font-size: 13px; font-weight: 800; }
+  #results { white-space: pre; font-family: monospace; font-size: 12px; background: #fff; padding: 8px; }
+</style>
+</head>
+<body>
+<div id="status">loading…</div>
+<div id="app">
+  <canvas id="gpu-canvas"></canvas>
+  <div id="controls"></div>
+</div>
+<div id="results">pending…</div>
+<script src="dev/out-app/app.js"></script>
+<script>
+function log(line) {
+  var el = document.getElementById('results');
+  el.textContent += line + "\n";
+  console.log('[verify]', line);
+}
+function dispatchPointer(el, type, x, y) {
+  var r = el.getBoundingClientRect();
+  var ev = new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+    clientX: r.left + x, clientY: r.top + y});
+  el.dispatchEvent(ev);
+}
+function waitFor(pred, timeoutMs, cb) {
+  var start = Date.now();
+  (function poll() {
+    if (pred()) { cb(true); return; }
+    if (Date.now() - start > timeoutMs) { cb(false); return; }
+    setTimeout(poll, 100);
+  })();
+}
+function hashStr(s) {
+  // cheap content hash (djb2), not just length — same-length-different-content
+  // PNGs are entirely possible for subtly different renders, so length alone
+  // is too weak a "did it actually change" signal.
+  var h = 5381;
+  for (var i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h;
+}
+window.__snap = {};
+function screenshotMarker(name) {
+  var canvas = document.getElementById('gpu-canvas');
+  try {
+    var data = canvas.toDataURL('image/png');
+    window.__snap[name] = {len: data.length, hash: hashStr(data)};
+    log(name + ': canvas dataURL length=' + data.length + ' hash=' + window.__snap[name].hash);
+  } catch (e) { log(name + ': toDataURL failed: ' + e); }
+}
+
+waitFor(function () { return window.__kami_cc_ready === true; }, 20000, function (ready) {
+  if (!ready) { log('FAIL: app never signaled ready (WebGPU init likely failed)'); return; }
+  log('PASS: app ready');
+  setTimeout(function () {
+    screenshotMarker('initial');
+
+    // precise targeting via data-testid (added to app.cljs specifically so this
+    // harness doesn't have to guess by CSS style, which was ambiguous: carousel
+    // arrow buttons and color swatches are both border-radius:50% buttons).
+    var heightRow = document.querySelector('[data-testid="slider-height"]');
+    if (!heightRow) { log('FAIL: slider-height row not found'); return; }
+    var track = Array.from(heightRow.querySelectorAll('div')).filter(function (d) {
+      return d.style.touchAction === 'none';
+    })[0];
+    if (!track) { log('FAIL: no slider track inside slider-height row'); return; }
+    log('dragging Height slider track');
+    dispatchPointer(track, 'pointerdown', 10, 9);
+    dispatchPointer(track, 'pointermove', 250, 9);
+    dispatchPointer(track, 'pointerup', 250, 9);
+
+    setTimeout(function () {
+      screenshotMarker('after-slider');
+      log('regen after slider drag: ' + window.__kami_cc_last_regen_ms + ' ms, count=' + window.__kami_cc_regen_count);
+
+      var skinRow = document.querySelector('[data-testid="swatch-row-skin"]');
+      if (!skinRow) { log('FAIL: swatch-row-skin not found'); return; }
+      var swatches = Array.prototype.filter.call(skinRow.querySelectorAll('button'),
+        function (b) { return b.style.borderRadius === '50%'; });
+      if (swatches.length < 2) { log('FAIL: expected >=2 skin swatches, found ' + swatches.length); return; }
+      var target = swatches[1]; // index 0 is the current-value preset; pick a genuinely different one
+      log('clicking skin swatch ' + target.style.background + ' (of ' + swatches.length + ' presets)');
+      target.click();
+
+      setTimeout(function () {
+        screenshotMarker('after-swatch');
+        log('regen after swatch click: ' + window.__kami_cc_last_regen_ms + ' ms, count=' + window.__kami_cc_regen_count + ', hairVerts=' + window.__kami_cc_last_hair_verts + ', hairPreset=' + window.__kami_cc_last_hair_preset);
+
+        var hairCarousel = document.querySelector('[data-testid="hair-carousel"]');
+        if (!hairCarousel) { log('FAIL: hair-carousel not found'); return; }
+        var arrowBtns = Array.prototype.filter.call(hairCarousel.querySelectorAll('button'),
+          function (b) { return b.textContent === '›'; });
+        if (arrowBtns.length === 0) { log('FAIL: no next-arrow found in hair-carousel'); return; }
+        log('paging hair-carousel forward x6 (long-straight -> ~mohawk, a drastically different style' +
+            ' — long-straight vs long-wavy at this camera distance/flat-shading turned out visually' +
+            ' too similar for a hash-diff to catch, even though the underlying mesh genuinely changed)');
+        for (var i = 0; i < 6; i++) arrowBtns[0].click();
+
+        setTimeout(function () {
+          screenshotMarker('after-carousel');
+          log('regen after carousel page: ' + window.__kami_cc_last_regen_ms + ' ms, count=' + window.__kami_cc_regen_count + ', hairVerts=' + window.__kami_cc_last_hair_verts + ', hairPreset=' + window.__kami_cc_last_hair_preset);
+
+          var a = window.__snap['initial'], b = window.__snap['after-slider'],
+              c = window.__snap['after-swatch'], d = window.__snap['after-carousel'];
+          log('---');
+          log('hashes: initial=' + (a && a.hash) + ' after-slider=' + (b && b.hash) +
+              ' after-swatch=' + (c && c.hash) + ' after-carousel=' + (d && d.hash));
+          log(((a && b && a.hash !== b.hash) ? 'PASS' : 'FAIL') + ': render changed after slider drag');
+          log(((b && c && b.hash !== c.hash) ? 'PASS' : 'FAIL') + ': render changed after swatch click');
+          log(((c && d && c.hash !== d.hash) ? 'PASS' : 'FAIL') + ': render changed after carousel page');
+          log('DONE');
+        }, 600);
+      }, 600);
+    }, 600);
+  }, 1500);
+});
+</script>
+</body>
+</html>
