@@ -37,3 +37,21 @@
       (is (every? #(= 4 (count %)) (:joints geo)))
       (is (every? #(= 4 (count %)) (:weights geo)))
       (is (every? #(< (Math/abs (- (reduce + %) 1.0)) 1e-4) (:weights geo))))))
+
+;; ── :uvs / :material / mesh-base-color-texture (real-VRM-base spike follow-up:
+;; kami.webgpu.mesh grew a texture path, so the reader side needs TEXCOORD_0 +
+;; the primitive's material index) ────────────────────────────────────────
+
+(deftest mesh-geometry-by-name-carries-uvs-and-material-index-test
+  (testing "TEXCOORD_0 (character-creator.gltf-build already writes it) and the primitive's :material index are both surfaced -- needed to resolve a part's texture"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          geo (gpu/body-mesh-geometry vdoc)]
+      (is (= (count (:positions geo)) (count (:uvs geo))))
+      (is (every? #(= 2 (count %)) (:uvs geo)))
+      (is (number? (:material geo))))))
+
+(deftest mesh-geometry-by-name-uvs-absent-for-untextured-parts-test
+  (testing "character-creator's own generated parts have no baseColorTexture yet, so mesh-base-color-texture is nil (not an error) -- the shared default-white-texture fallback in kami.webgpu.mesh covers this"
+    (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))]
+      (is (nil? (gpu/mesh-base-color-texture vdoc "body")))
+      (is (nil? (gpu/mesh-base-color-texture vdoc "nonexistent-mesh"))))))

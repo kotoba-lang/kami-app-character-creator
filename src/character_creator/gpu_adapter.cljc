@@ -21,6 +21,13 @@
        (partition 3)
        (mapv vec)))
 
+(defn- accessor->vec2s
+  "Accessor index -> `[[u v] ...]`."
+  [vdoc acc-idx]
+  (->> (conv/read-accessor-f32 vdoc acc-idx)
+       (partition 2)
+       (mapv vec)))
+
 (defn mesh-geometry
   "`mesh-idx`'s sole primitive -> `{:positions :normals :indices :morph-target-
   names :morph-target-deltas}`. `:morph-target-deltas` is index-aligned with
@@ -55,18 +62,40 @@
   throwing — callers (interactive UIs cycling through presets) should treat
   a missing part as \"nothing to draw this frame\", not an error.
   `:joints`/`:weights` are only present if the primitive actually carries
-  `JOINTS_0`/`WEIGHTS_0` (skinned parts, currently just \"body\")."
+  `JOINTS_0`/`WEIGHTS_0` (skinned parts, currently just \"body\").
+  `:uvs` present if the primitive carries `TEXCOORD_0` — new for the /loop
+  maturity pass' texture work (`character-creator's` own generated parts
+  already write `TEXCOORD_0` via `gltf-build/add-part-mesh`, but nothing
+  read it back out until now; a real parsed VRM like VRoid Studio output
+  always carries it on painted meshes)."
   [vdoc mesh-name]
   (let [meshes (get-in vdoc [:gltf :meshes])
         mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
     (when mesh-idx
       (let [prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])
-            {:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0]} (:attributes prim)]
+            {:keys [POSITION NORMAL JOINTS_0 WEIGHTS_0 TEXCOORD_0]} (:attributes prim)]
         (cond-> {:positions (accessor->vec3s vdoc POSITION)
                  :normals (accessor->vec3s vdoc NORMAL)
-                 :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))}
+                 :indices (mapv int (conv/read-accessor-f32 vdoc (:indices prim)))
+                 :material (:material prim)}
           JOINTS_0 (assoc :joints (->> (conv/read-accessor-f32 vdoc JOINTS_0) (partition 4) (mapv #(mapv int %))))
-          WEIGHTS_0 (assoc :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec))))))))
+          WEIGHTS_0 (assoc :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec)))
+          TEXCOORD_0 (assoc :uvs (accessor->vec2s vdoc TEXCOORD_0)))))))
+
+(defn mesh-base-color-texture
+  "`mesh-name`'s sole primitive's material -> `{:bytes :mime-type}` (see
+  `vrm.convert/read-base-color-texture`), or `nil` if the mesh doesn't
+  exist, has no material, or that material has no embedded baseColorTexture
+  (e.g. every procedurally-generated character-creator part today — this
+  is meaningful against a real parsed VRM like VRoid Studio output, which
+  paints faces via a texture)."
+  [vdoc mesh-name]
+  (let [meshes (get-in vdoc [:gltf :meshes])
+        mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
+    (when mesh-idx
+      (let [prim (get-in vdoc [:gltf :meshes mesh-idx :primitives 0])]
+        (when-let [mat-idx (:material prim)]
+          (conv/read-base-color-texture vdoc mat-idx))))))
 
 (defn body-mesh-geometry
   "`\"body\"`'s sole primitive -> `{:positions :normals :indices :joints

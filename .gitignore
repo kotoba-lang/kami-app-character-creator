@@ -4,3 +4,11 @@
 dev/out/
 dev/out-app/
 dev/out-pattern/
+dev/out-texture/
+# Never commit — VRM Public License 1.0 (VirtualCast, Inc.), not CC0.
+# Local-only test asset + throwaway demo for the /loop maturity pass
+# real-VRM-base spike (texture/toon verification).
+Seed-san.vrm
+dev/character_creator/texture_demo.cljs
+texture-demo.html
+dev/texture-build.edn
