@@ -45,6 +45,23 @@
       (is (nil? (acc/generate-accessory-part :nope bwp)))
       (is (nil? (acc/generate-decal-part :nope bwp))))))
 
+(deftest draw-pattern-matches-decal-origin-test
+  (testing "draw-pattern's centre equals decal-origin (same coordinate space as the baked mesh)"
+    (let [bwp (bone-world-pos-by-name)]
+      (doseq [id (keys acc/decal-catalog)]
+        (when-let [{:keys [params kind]} (acc/draw-pattern id bwp)]
+          (let [origin (acc/decal-origin id bwp)
+                [px py pz r] params]
+            (is (= 2 kind))
+            (is (= origin [px py pz]))
+            (is (pos? r))))))))
+
+(deftest draw-pattern-nil-for-no-pattern-entry-test
+  (testing ":tattoo-shoulder has no :pattern in the catalog -> draw-pattern returns nil (flat colour, backward compatible)"
+    (let [bwp (bone-world-pos-by-name)]
+      (is (nil? (:pattern (:tattoo-shoulder acc/decal-catalog))))
+      (is (nil? (acc/draw-pattern :tattoo-shoulder bwp))))))
+
 (deftest accessories-are-positioned-near-their-attach-bone-test
   (testing "an accessory's vertices sit within a plausible radius of its attach bone (not at the origin/some default)"
     (let [bwp (bone-world-pos-by-name)

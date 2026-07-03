@@ -197,12 +197,24 @@
 ;; ── decal catalog (see namespace docstring — NOT real texture decals) ────
 
 (def decal-catalog
-  "id -> `{:label :attach-bone :offset :normal :half-size :base-color}`.
-   `:normal` is a fixed, hand-chosen outward-facing direction (world-space-
-   ish, since these limbs/torso are built along known axes — see each
-   entry's comment) — there is no generic per-vertex surface-normal lookup
-   at an arbitrary anchor point in this mesh representation, so a manually
-   chosen direction is the pragmatic honest approximation, not a bug."
+  "id -> `{:label :attach-bone :offset :normal :half-size :base-color
+   :pattern}`. `:normal` is a fixed, hand-chosen outward-facing direction
+   (world-space-ish, since these limbs/torso are built along known axes —
+   see each entry's comment) — there is no generic per-vertex surface-normal
+   lookup at an arbitrary anchor point in this mesh representation, so a
+   manually chosen direction is the pragmatic honest approximation, not a
+   bug.
+
+   `:pattern` (optional — added /loop maturity pass, procedural material
+   variety, ADR-2607031200): `{:kind :radial :fade-to [r g b] :radius}`.
+   `kami.webgpu.mesh`'s shader blends `:base-color` -> `:fade-to` by
+   distance (in the SAME baked-vertex coordinate space `decal-origin`
+   computes, below) from the decal's own placement origin out to `:radius`
+   — a scar/tattoo edge that softens instead of a hard-edged flat rectangle.
+   `:fade-to` is a fixed approximate skin/faded-ink tone, not the live
+   character's actual skin colour (the catalog is static data with no
+   access to a live `CharacterDoc` — a documented approximation, same
+   honesty convention as everything else in this file)."
   {:tattoo-arm-band
    {:label "Arm band tattoo" :attach-bone "leftLowerArm"
     ;; `arm-mesh`'s radius at this point along the forearm is ~0.02-0.03 —
@@ -212,7 +224,8 @@
     ;; fully embedded/invisible inside the arm (caught by this session's
     ;; own headless-Chrome content-hash verification, not eyeballed).
     :offset [-0.05 0.0 0.035] :normal [0.0 0.0 1.0] :half-size [0.02 0.012]
-    :base-color [0.12 0.16 0.35 1.0]}                          ;; wraps the forearm, facing +Z (front)
+    :base-color [0.12 0.16 0.35 1.0]                            ;; wraps the forearm, facing +Z (front)
+    :pattern {:kind :radial :fade-to [0.42 0.46 0.58] :radius 0.020}}
    :tattoo-shoulder
    {:label "Shoulder tattoo" :attach-bone "leftShoulder"
     :offset [-0.02 -0.01 0.03] :normal [-0.3 0.2 0.9] :half-size [0.025 0.025]
@@ -220,7 +233,24 @@
    :scar-cheek
    {:label "Cheek scar" :attach-bone "head"
     :offset [0.06 -0.02 0.06] :normal [0.9 0.0 0.4] :half-size [0.006 0.03]
-    :base-color [0.75 0.45 0.42 1.0]}})                         ;; thin vertical streak, outward+forward off the cheek
+    :base-color [0.75 0.45 0.42 1.0]                            ;; thin vertical streak, outward+forward off the cheek
+    ;; fade-to matches `character-creator.doc/default-palette`'s default
+    ;; skin tone — an approximation of "fades into skin", not the live
+    ;; character's own colour (see docstring above).
+    :pattern {:kind :radial :fade-to [0.94 0.87 0.82] :radius 0.030}}})
+
+(defn decal-origin
+  "The world-rest-space point `generate-decal-part` places decal `id`'s quad
+   at (`bone-world-pos-by-name`'s `:attach-bone` position + `:offset` + a
+   small clearance along `:normal`) — factored out so callers that need
+   this point WITHOUT the mesh itself (e.g. a pattern's gradient centre,
+   which must be expressed in the exact same coordinate space the baked
+   vertex positions end up in) don't duplicate the formula. Returns `nil`
+   for an unknown id."
+  [id bone-world-pos-by-name]
+  (when-let [{:keys [attach-bone offset normal]} (get decal-catalog id)]
+    (v3+ (get bone-world-pos-by-name attach-bone [0.0 0.0 0.0])
+         (v3+ offset (v3* (v3-norm normal) 0.006)))))
 
 (defn generate-decal-part
   "Like `generate-accessory-part` but for `decal-catalog` — a single flat
@@ -235,9 +265,22 @@
    fully embedded/invisible, caught by headless-Chrome content-hash
    verification). Returns `nil` for an unknown id."
   [id bone-world-pos-by-name]
-  (when-let [{:keys [attach-bone offset normal half-size]} (get decal-catalog id)]
-    (let [origin (v3+ (get bone-world-pos-by-name attach-bone [0.0 0.0 0.0])
-                       (v3+ offset (v3* (v3-norm normal) 0.006)))
+  (when-let [{:keys [normal half-size]} (get decal-catalog id)]
+    (let [origin (decal-origin id bone-world-pos-by-name)
           [hw hh] half-size
           part (orient-to-normal (quad-mesh hw hh) normal origin)]
       (assoc part :name (name id) :material id))))
+
+(defn draw-pattern
+  "`decal-catalog`'s `:pattern` (if present, for `id`) + `bone-world-pos-
+   by-name` -> a `kami.webgpu.mesh/draw!`-shaped pattern opts map (`{:color-b
+   :kind :params}`, `:kind` as the shader's integer code — `:radial` -> `2`)
+   ready to pass straight through, or `nil` for no pattern (draw flat, the
+   pre-existing behaviour). `:params` is `[cx cy cz radius]`, `[cx cy cz]`
+   from `decal-origin` — the exact point the decal's own vertices are baked
+   around, so the gradient centre lines up with the actual quad, not a
+   guess."
+  [id bone-world-pos-by-name]
+  (when-let [{:keys [fade-to radius]} (:pattern (get decal-catalog id))]
+    (let [[cx cy cz] (decal-origin id bone-world-pos-by-name)]
+      {:color-b fade-to :kind 2 :params [cx cy cz radius]})))
