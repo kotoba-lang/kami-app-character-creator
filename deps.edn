@@ -1,0 +1,9 @@
+{:paths ["src"]
+ ;; west checks this repo out as a sibling of orgs/kotoba-lang/{vrm,character}
+ ;; (orgs/kotoba-lang/kami-app-character-creator/), so relative :local/root resolves.
+ :deps {io.github.kotoba-lang/vrm {:local/root "../vrm"}
+        io.github.kotoba-lang/character {:local/root "../character"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {io.github.cognitect-labs/test-runner
+                               {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                  :main-opts ["-m" "cognitect.test-runner"]}}}
