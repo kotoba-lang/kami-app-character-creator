@@ -44,6 +44,12 @@
                                      ;; slider change visibly deforms the mesh rather than the
                                      ;; camera silently re-centering/re-zooming to compensate.
 (defonce !n-bones (atom 13))
+(defonce !bone-world-pos (atom nil))  ;; name -> [x y z], rest pose — set once at
+                                     ;; init (0-arity skeleton, matching !n-bones'
+                                     ;; own simplification); used to resolve a
+                                     ;; decal's pattern gradient centre at draw
+                                     ;; time (character-creator.accessories/
+                                     ;; draw-pattern), not just its placement.
 (defonce !widgets (atom {}))        ;; key -> widget instance ({:set-value ...}), so Randomize can
                                      ;; push new values into the DOM, not just mutate !doc invisibly
 
@@ -499,6 +505,9 @@
                     mctx (mesh/init! device fmt)
                     skeleton (cbody/generate-humanoid-skeleton)
                     _ (reset! !n-bones (count (:bones skeleton)))
+                    _ (reset! !bone-world-pos
+                              (zipmap (mapv :name (:bones skeleton))
+                                      (cbody/bone-world-positions (:bones skeleton))))
                     vdoc0 (pipeline/character-doc->vrm-document @!doc)
                     head-geo0 (gpu/head-mesh-geometry vdoc0)
                     body-geo0 (gpu/body-mesh-geometry vdoc0)
@@ -549,8 +558,16 @@
                            (mesh/draw! mctx pass head head-mvp skin weights [])
                            (mesh/draw! mctx pass body body-mvp skin [] joints)
                            (when hair-mesh (mesh/draw! mctx pass hair-mesh hair-mvp hair-color [] []))
-                           (doseq [[_id {:keys [buffers group color]}] extras]
-                             (mesh/draw! mctx pass buffers (if (= :head group) head-mvp body-mvp) color [] []))
+                           (doseq [[id {:keys [buffers group color]}] extras]
+                             ;; decal-catalog entries may carry a :pattern (radial
+                             ;; gradient fade, e.g. :scar-cheek/:tattoo-arm-band) —
+                             ;; acc/draw-pattern resolves it against the SAME rest-
+                             ;; pose bone positions the mesh itself was baked
+                             ;; relative to, or returns nil for plain-color parts
+                             ;; (every accessory, and decals with no :pattern
+                             ;; entry) so they draw exactly as before.
+                             (let [pattern (acc/draw-pattern id @!bone-world-pos)]
+                               (mesh/draw! mctx pass buffers (if (= :head group) head-mvp body-mvp) color [] [] pattern)))
                            (.end pass)
                            (.submit (.-queue device) #js [(.finish enc)])))
                        (tick))))

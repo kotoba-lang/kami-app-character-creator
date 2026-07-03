@@ -23,4 +23,11 @@
                       :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
                                    io.github.kotoba-lang/webgpu {:local/root "../webgpu"}
                                    io.github.kotoba-lang/kami-ui-sdk {:local/root "../kami-ui-sdk"}}
-                      :main-opts ["-m" "cljs.main" "-co" "dev/app-build.edn" "-c" "character-creator.app"]}}}
+                      :main-opts ["-m" "cljs.main" "-co" "dev/app-build.edn" "-c" "character-creator.app"]}
+           ;; /loop maturity pass — procedural material patterns (kami.webgpu.mesh's
+           ;; new color_b/pattern_kind/pattern_params uniform): a flat-vs-gradient
+           ;; side-by-side proof for pattern-demo.html, same dev-only shape as :cljs.
+           :cljs-pattern {:extra-paths ["dev"]
+                          :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
+                                       io.github.kotoba-lang/webgpu {:local/root "../webgpu"}}
+                          :main-opts ["-m" "cljs.main" "-co" "dev/pattern-build.edn" "-c" "character-creator.pattern-demo"]}}}

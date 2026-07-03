@@ -1,0 +1,6 @@
+{:main character-creator.pattern-demo
+ :output-to "dev/out-pattern/pattern.js"
+ :output-dir "dev/out-pattern"
+ :optimizations :simple
+ :target :browser
+ :asset-path "out-pattern"}
