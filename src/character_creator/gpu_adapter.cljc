@@ -65,6 +65,19 @@
       WEIGHTS_0 (assoc :weights (->> (conv/read-accessor-f32 vdoc WEIGHTS_0) (partition 4) (mapv vec)))
       TEXCOORD_0 (assoc :uvs (accessor->vec2s vdoc TEXCOORD_0)))))
 
+(defn mesh-primitives-by-index
+  "Like `mesh-primitives-by-name`, but resolves the mesh by its raw index
+  into `(:gltf :meshes)` instead of by `:name` — for an arbitrary UPLOADED
+  VRM (character-creator.app's file-upload feature), where mesh names are
+  whatever the original author's tool wrote and can't be relied on the way
+  `character-creator`'s own generated `\"body\"`/`\"hair\"`/... names can.
+  Returns `[]` if `mesh-idx` is out of range."
+  [vdoc mesh-idx]
+  (let [meshes (get-in vdoc [:gltf :meshes])]
+    (if (or (nil? mesh-idx) (< mesh-idx 0) (>= mesh-idx (count meshes)))
+      []
+      (mapv #(primitive->geometry vdoc %) (get-in vdoc [:gltf :meshes mesh-idx :primitives])))))
+
 (defn mesh-primitives-by-name
   "Like `mesh-geometry-by-name`, but returns a vector of geometry maps — ONE
   PER PRIMITIVE, not just the first. Real bug fix (/loop maturity pass,
@@ -85,9 +98,7 @@
   [vdoc mesh-name]
   (let [meshes (get-in vdoc [:gltf :meshes])
         mesh-idx (first (keep-indexed (fn [i m] (when (= mesh-name (:name m)) i)) meshes))]
-    (if-not mesh-idx
-      []
-      (mapv #(primitive->geometry vdoc %) (get-in vdoc [:gltf :meshes mesh-idx :primitives])))))
+    (mesh-primitives-by-index vdoc mesh-idx)))
 
 (defn mesh-geometry-by-name
   "Like `mesh-geometry`, but resolves the mesh by its `character/generate-

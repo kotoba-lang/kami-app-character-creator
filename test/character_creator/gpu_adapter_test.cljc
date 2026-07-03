@@ -107,6 +107,17 @@
     (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))]
       (is (= [] (gpu/mesh-primitives-by-name vdoc "nonexistent-mesh"))))))
 
+(deftest mesh-primitives-by-index-test
+  (testing "resolves a mesh by raw index (for an uploaded VRM whose mesh names can't be relied on), same shape as mesh-primitives-by-name"
+    (let [vdoc0 (pipeline/character-doc->vrm-document (doc/default-character-doc))
+          body-idx (first (keep-indexed (fn [i m] (when (= "body" (:name m)) i)) (get-in vdoc0 [:gltf :meshes])))
+          by-name (gpu/mesh-primitives-by-name vdoc0 "body")
+          by-idx (gpu/mesh-primitives-by-index vdoc0 body-idx)]
+      (is (= by-name by-idx))
+      (is (= [] (gpu/mesh-primitives-by-index vdoc0 nil)))
+      (is (= [] (gpu/mesh-primitives-by-index vdoc0 -1)))
+      (is (= [] (gpu/mesh-primitives-by-index vdoc0 99999))))))
+
 (deftest material-base-color-texture-nil-material-idx-test
   (testing "material-base-color-texture takes a material index directly (for per-primitive resolution) and is nil-safe"
     (let [vdoc (pipeline/character-doc->vrm-document (doc/default-character-doc))]
