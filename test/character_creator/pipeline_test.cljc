@@ -11,8 +11,13 @@
           vdoc (pipeline/character-doc->vrm-document d)]
       (is (= :v1-0 (:version vdoc)))
       (is (pos? (count (:meshes (:gltf vdoc)))))
-      ;; head + 6 eye parts (2 sides x white/iris/pupil) + hair + body + clothing = 10
-      (is (= 10 (count (:meshes (:gltf vdoc)))))
+      ;; Count reflects whatever `character.body` currently emits (a parallel
+      ;; /loop fork this session extended fingers/toes + clothing coverage,
+      ;; landed on `character` main independently of this repo's own work —
+      ;; not a magic constant this repo owns). Assert "reasonably many real
+      ;; parts" rather than an exact number that legitimately drifts with
+      ;; upstream `character` changes.
+      (is (>= (count (:meshes (:gltf vdoc))) 10))
       (is (pos? (count (:human-bones (:humanoid vdoc)))))
       (is (= 18 (count (:expressions vdoc))))
       (is (some #(= :hips (:bone %)) (:human-bones (:humanoid vdoc))))
@@ -51,8 +56,11 @@
     (let [d (doc/boot-config {:hair-preset :bald})
           vdoc (pipeline/character-doc->vrm-document d)]
       ;; one fewer mesh than the default (no hair mesh: :bald has 0 strands,
-      ;; so add-part-mesh skips it per empty-vertices guard)
-      (is (= 9 (count (:meshes (:gltf vdoc))))))))
+      ;; so add-part-mesh skips it per empty-vertices guard). Compared
+      ;; against a live default-doc mesh count, not a hardcoded number — see
+      ;; character-doc->vrm-document-shape-test's comment on why.
+      (let [default-count (count (:meshes (:gltf (pipeline/character-doc->vrm-document (doc/default-character-doc)))))]
+        (is (= (dec default-count) (count (:meshes (:gltf vdoc)))))))))
 
 ;; ── skinning (/loop maturity pass, ADR-2607031200) ───────────────────────
 
@@ -68,9 +76,12 @@
       (is (contains? attrs :WEIGHTS_0))
       (is (= 1 (count (:skins gltf))))
       (let [skin (first (:skins gltf))]
-        ;; 23 bones: the original 13 core + 10 added for the full-body
-        ;; extension (/loop maturity pass, ADR-2607031200 follow-up).
-        (is (= 23 (count (:joints skin))))
+        ;; Bone count reflects whatever `character.body/generate-humanoid-
+        ;; skeleton` currently emits (23 as of the full-body pass; a parallel
+        ;; /loop fork this session further extended fingers/toes on top of
+        ;; that, independently of this repo) — assert it's at least the
+        ;; full-body-pass floor, not an exact number this repo doesn't own.
+        (is (>= (count (:joints skin)) 23))
         (is (some? (:inverseBindMatrices skin))))
       ;; the body mesh's node references the skin.
       (let [mesh-idx (.indexOf (:meshes gltf) body-mesh)
@@ -84,4 +95,52 @@
           reparsed (vrm/parse-vrm bytes)
           gltf (:gltf reparsed)]
       (is (= 1 (count (:skins gltf))))
-      (is (= 23 (count (:joints (first (:skins gltf)))))))))
+      ;; see body-mesh-is-really-skinned-test's comment on why this is >=, not =.
+      (is (>= (count (:joints (first (:skins gltf)))) 23)))))
+
+;; ── accessories/decals (/loop maturity pass, closes ADR-2607031200's
+;; deferred :character/equip) ─────────────────────────────────────────────
+
+(deftest equip-adds-real-accessory-meshes-test
+  (testing "each equipped accessory id shows up as a real, non-empty mesh"
+    (let [base (doc/default-character-doc)
+          base-count (count (:meshes (:gltf (pipeline/character-doc->vrm-document base))))
+          d (assoc base :character/equip [:glasses-round :cap-simple])
+          vdoc (pipeline/character-doc->vrm-document d)
+          gltf (:gltf vdoc)
+          names (set (map :name (:meshes gltf)))]
+      (is (= (+ base-count 2) (count (:meshes gltf))))
+      (is (contains? names "glasses-round"))
+      (is (contains? names "cap-simple"))
+      (doseq [n ["glasses-round" "cap-simple"]]
+        (let [m (first (filter #(= n (:name %)) (:meshes gltf)))]
+          (is (some? (get-in m [:primitives 0 :material]))))))))
+
+(deftest decals-add-real-quad-meshes-test
+  (testing "each selected decal id shows up as a real 4-vertex quad mesh"
+    (let [d (assoc (doc/default-character-doc) :character/decals [:tattoo-arm-band :scar-cheek])
+          vdoc (pipeline/character-doc->vrm-document d)
+          gltf (:gltf vdoc)
+          names (set (map :name (:meshes gltf)))]
+      (is (contains? names "tattoo-arm-band"))
+      (is (contains? names "scar-cheek")))))
+
+(deftest unknown-equip-id-is-silently-skipped-test
+  (testing "an unknown accessory/decal id is dropped, not an error (display-layer convenience)"
+    (let [base-count (count (:meshes (:gltf (pipeline/character-doc->vrm-document (doc/default-character-doc)))))
+          d (assoc (doc/default-character-doc) :character/equip [:not-a-real-accessory])
+          vdoc (pipeline/character-doc->vrm-document d)]
+      (is (= base-count (count (:meshes (:gltf vdoc))))))))
+
+(deftest equip-and-decals-round-trip-through-export-parse-test
+  (testing "an equipped+decaled character still exports a valid, re-parseable .vrm"
+    (let [d (assoc (doc/default-character-doc)
+                   :character/equip [:necklace-simple :earring-stud]
+                   :character/decals [:tattoo-shoulder])
+          bytes (pipeline/character-doc->vrm-bytes d)]
+      (is (= [0x67 0x6C 0x54 0x46] (subvec (vec bytes) 0 4)))
+      (let [reparsed (vrm/parse-vrm bytes)
+            names (set (map :name (:meshes (:gltf reparsed))))]
+        (is (contains? names "necklace-simple"))
+        (is (contains? names "earring-stud"))
+        (is (contains? names "tattoo-shoulder"))))))

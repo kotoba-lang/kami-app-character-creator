@@ -8,7 +8,13 @@
   `:hair :color` / `:eyes :iris-color` fields. Keeping both would be two
   sources of truth for the same three colours, so `:character/palette` here
   is a *convenience alias* `boot-config` merges into those nested
-  `CharacterDef` fields, not a parallel state slot on the resolved doc."
+  `CharacterDef` fields, not a parallel state slot on the resolved doc.
+
+  `:character/equip` (the ADR's own name for this field) and `:character/
+  decals` (new, not in the original ADR sketch) are now real — vectors of
+  `character-creator.accessories/accessory-catalog` / `decal-catalog` id
+  keywords, resolved into extra mesh parts by `character-creator.pipeline`.
+  Empty vectors by default (no accessories/decals on a fresh character)."
   (:require [character.params :as params]))
 
 (def default-palette
@@ -28,12 +34,15 @@
   {:character/id (str (gensym "char-"))
    :character/name "New Character"
    :character/def (params/default-character-def)
-   :character/palette default-palette})
+   :character/palette default-palette
+   :character/equip []
+   :character/decals []})
 
 (defn boot-config
-  "`{:id :name :palette :hair-preset :clothing-preset :overrides}` -> a
-  resolved `CharacterDoc`. Mirrors `kami-app-car-sim`'s `scene.cljc/
-  boot-config` (id + paint-hex + map -> one pure config map) pattern.
+  "`{:id :name :palette :hair-preset :clothing-preset :equip :decals
+  :overrides}` -> a resolved `CharacterDoc`. Mirrors `kami-app-car-sim`'s
+  `scene.cljc/boot-config` (id + paint-hex + map -> one pure config map)
+  pattern.
 
   `:overrides` is a `[[path value] ...]` seq of extra `assoc-in`s into the
   `CharacterDef` (e.g. `[[[:body :height] 1.1]]`) for params this fn doesn't
@@ -41,8 +50,8 @@
   base-character library like the car-sim garage's 6 vehicles), so `:id` is
   presently just an opaque passthrough, not a lookup key; a base-preset
   library is future work, not fabricated here."
-  [{:keys [id name palette hair-preset clothing-preset overrides]
-    :or {palette default-palette}}]
+  [{:keys [id name palette hair-preset clothing-preset equip decals overrides]
+    :or {palette default-palette equip [] decals []}}]
   (let [base (apply-palette (params/default-character-def) palette)
         base (cond-> base
                hair-preset (assoc-in [:hair :preset] hair-preset)
@@ -51,4 +60,6 @@
     {:character/id (or id (str (gensym "char-")))
      :character/name (or name "New Character")
      :character/def def
-     :character/palette palette}))
+     :character/palette palette
+     :character/equip equip
+     :character/decals decals}))
