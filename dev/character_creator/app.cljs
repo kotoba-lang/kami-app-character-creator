@@ -31,7 +31,9 @@
             [character.body :as cbody]
             [kami.webgpu.mesh :as mesh]
             [kami-ui-sdk.widgets :as w]
-            [kami-ui-sdk.ui :as ui]))
+            [kami-ui-sdk.ui :as ui]
+            [vrm.parse :as vparse]
+            [vrm.expression :as vexpr]))
 
 ;; ─── state ──────────────────────────────────────────────────────────────
 
@@ -52,6 +54,24 @@
                                      ;; draw-pattern), not just its placement.
 (defonce !widgets (atom {}))        ;; key -> widget instance ({:set-value ...}), so Randomize can
                                      ;; push new values into the DOM, not just mutate !doc invisibly
+
+;; ─── uploaded-VRM state (owner directive: never bundle/commit a base VRM —
+;; ship the CAPABILITY to load a user-supplied one instead, same pattern
+;; M3-org/CharacterStudio uses — "Drag and drop local 3D files (VRM)". When
+;; `!uploaded` is non-nil the render loop draws the real uploaded model
+;; instead of the procedural one; the procedural sliders/carousels above
+;; stay fully interactive (they just have no visible effect while an
+;; uploaded model is active — additive, not a mode-switcher UI) ------------
+
+(defonce !uploaded (atom nil))
+;; nil, or {:vdoc :status ("loading"/"ready"/"error: ...") :meshes [{:mesh-idx
+;;  :primitives [{:buffers :material :joint-count}]}] :fit {:center :scale}
+;;  :expr-mgr :expr-names :active-expr}. :textures is a SEPARATE atom (below)
+;; since texture decode is async and must not block the rest of this map.
+(defonce !uploaded-textures (atom {})) ;; [mesh-idx prim-idx] -> GPUTexture, filled in as each
+                                        ;; upload-texture! promise resolves (render loop just
+                                        ;; reads whatever's there each frame -- nil = draw with
+                                        ;; kami.webgpu.mesh's own default-white fallback)
 
 (defn- log [& xs] (.apply (.-log js/console) js/console (clj->js xs)))
 
@@ -362,6 +382,94 @@
     (regen! mctx)
     (set! (.-__kami_cc_randomize_count js/window) (inc (or (.-__kami_cc_randomize_count js/window) 0)))))
 
+;; ─── uploaded-VRM: parse + upload every mesh's every primitive -----------
+
+(defn- upload-primitive-texture!
+  "Kick off `mesh/upload-texture!` for one primitive's material, if it has an
+   embedded baseColorTexture — resolves into `!uploaded-textures` async (the
+   render loop just reads whatever's there each frame; nil until it resolves
+   draws with `kami.webgpu.mesh`'s own default-white fallback, same
+   backward-compat trick every other texture consumer here relies on)."
+  [mctx vdoc mesh-idx prim-idx material]
+  (when-let [tex-data (gpu/material-base-color-texture vdoc material)]
+    (-> (mesh/upload-texture! mctx tex-data)
+        (.then (fn [tex] (swap! !uploaded-textures assoc [mesh-idx prim-idx] tex)))
+        (.catch (fn [err] (log "uploaded-VRM texture decode failed, mesh" mesh-idx "prim" prim-idx ":" err))))))
+
+(defn clear-uploaded! []
+  (reset! !uploaded nil)
+  (reset! !uploaded-textures {}))
+
+(defn load-vrm-file!
+  "`file`: a real `js/File` from a `<input type=file>` change event (or an
+   equivalent `.arrayBuffer()`-capable object, e.g. a test harness's
+   synthetic File). Parses via `vrm.parse/parse-vrm` (this session's earlier spike
+   proved this handles real production VRM 1.0 files, sparse-accessor
+   blend shapes included) and uploads every mesh's every primitive
+   (`gpu/mesh-primitives-by-index` — the multi-primitive-aware reader, since
+   an arbitrary uploaded file's mesh names can't be relied on the way
+   character-creator's own generated \"body\"/\"hair\"/... names can) as real
+   GPU buffers, kicking off async texture decode per primitive. On success,
+   `!uploaded` flips to `:status \"ready\"` and the render loop (below)
+   switches from drawing the procedural character to this real one — a
+   status line, not a mode-switcher UI, makes the switch visible; the
+   procedural sliders/carousels stay fully interactive throughout, they
+   just have no visible effect while an uploaded model is active (additive,
+   not a replacement — `clear-uploaded!` returns to the procedural view)."
+  [mctx file]
+  (reset! !uploaded {:status "loading…"})
+  (-> (.arrayBuffer file)
+      (.then
+        (fn [ab]
+          (try
+            (let [bytes (vec (js/Uint8Array. ab))
+                  vdoc (vparse/parse-vrm bytes)
+                  n-meshes (count (get-in vdoc [:gltf :meshes]))
+                  primitives-by-mesh (mapv #(gpu/mesh-primitives-by-index vdoc %) (range n-meshes))
+                  ;; one shared bbox fit across EVERY mesh's positions, so the whole
+                  ;; uploaded model sits centred/scaled together in frame -- not each
+                  ;; mesh independently re-centred (which would visibly pull parts apart).
+                  fit (bbox-fit (mapcat (fn [prims] (mapcat :positions prims)) primitives-by-mesh))
+                  meshes
+                  (mapv
+                    (fn [mesh-idx prims]
+                      {:mesh-idx mesh-idx
+                       :primitives
+                       (mapv
+                         (fn [prim-idx {:keys [positions normals indices uvs joints weights material]}]
+                           (upload-primitive-texture! mctx vdoc mesh-idx prim-idx material)
+                           {:buffers (mesh/upload-mesh!
+                                       mctx {:positions (fit-positions positions fit)
+                                             :normals normals :indices indices :uvs uvs
+                                             :joints joints :weights weights})})
+                         (range (count prims)) prims)})
+                    (range n-meshes) primitives-by-mesh)
+                  expr-mgr (vexpr/new-manager (:expressions vdoc))
+                  expr-names (mapv :name (:expressions vdoc))]
+              (reset! !uploaded-textures {})
+              (reset! !uploaded {:vdoc vdoc :status "ready" :meshes meshes :fit fit
+                                  :expr-mgr expr-mgr :expr-names expr-names
+                                  :active-expr (first expr-names)})
+              (log "uploaded VRM ready —" n-meshes "meshes," (count expr-names) "expressions"))
+            (catch :default err
+              (reset! !uploaded {:status (str "error: " err)})
+              (log "uploaded VRM parse failed:" err)))))
+      (.catch (fn [err] (reset! !uploaded {:status (str "error: " err)}) (log "uploaded VRM read failed:" err)))))
+
+(defn- uploaded-morph-weights
+  "`resolve-expression`'s `:morphs` is `{[mesh-idx morph-idx] weight}` (one
+   shared table across the whole VrmDocument) -> a dense per-mesh vector
+   sized `morph-count`, index-aligned with that mesh's own morph targets
+   (VRM's `morphTargetBind.index` addresses a mesh's target list directly,
+   the same convention every primitive of that mesh is assumed to share —
+   the common case; a VRM authoring a per-primitive-divergent target list
+   is not handled here, same scope as everywhere else this session applied
+   morph weights per-mesh not per-primitive)."
+  [mesh-idx morph-count morphs]
+  (reduce (fn [v [[m t] w]] (if (and (= m mesh-idx) (< t morph-count)) (assoc v t w) v))
+          (vec (repeat morph-count 0.0))
+          morphs))
+
 (defn- mk-button! [container {:keys [test-id label bg on-click]}]
   (let [btn (.createElement js/document "button")]
     (.setAttribute btn "data-testid" test-id)
@@ -475,7 +583,56 @@
     (mk-button! row
       {:test-id "export-edn-btn" :label "Download .edn" :bg (get-in ui/theme [:accent :green])
        :on-click (fn [_] (persist/download-edn! @!doc)
-                         (set! (.-__kami_cc_exported_edn js/window) true))})))
+                         (set! (.-__kami_cc_exported_edn js/window) true))}))
+
+  ;; ─── Load your own VRM — never bundle/commit a specific base model
+  ;; (licensing), ship the CAPABILITY to load a user-supplied one instead
+  ;; (M3-org/CharacterStudio's "drag and drop local 3D files" pattern).
+  ;; Additive: the procedural controls above stay fully live throughout.
+  (panel-heading container "Load your own VRM")
+  (let [note (.createElement js/document "div")
+        status (.createElement js/document "div")
+        expr-row (.createElement js/document "div")
+        file-input (.createElement js/document "input")]
+    (set! (.-textContent note)
+          "Bring your own VRM 1.0 avatar (VRoid Studio/Hub export, or any VRM you own) for a real sculpted model instead of the procedural one above.")
+    (.setProperty (.-style note) "font-size" "11px")
+    (.setProperty (.-style note) "color" (:text-secondary ui/theme))
+    (.appendChild container note)
+    (.setAttribute file-input "type" "file")
+    (.setAttribute file-input "accept" ".vrm")
+    (.setAttribute file-input "data-testid" "vrm-upload-input")
+    (.addEventListener file-input "change"
+      (fn [e]
+        (when-let [file (-> e .-target .-files (aget 0))]
+          (load-vrm-file! mctx file))))
+    (.appendChild container file-input)
+    (.setAttribute status "data-testid" "vrm-upload-status")
+    (.setProperty (.-style status) "font-size" "12px")
+    (.setProperty (.-style status) "font-weight" "800")
+    (set! (.-textContent status) "No file loaded — using procedural character.")
+    (.appendChild container status)
+    (.setAttribute expr-row "data-testid" "uploaded-expr-carousel")
+    (.appendChild container expr-row)
+    (add-watch !uploaded :status-line
+      (fn [_ _ _ u]
+        (set! (.-__kami_cc_uploaded_status js/window) (if u (:status u) nil))
+        (set! (.-__kami_cc_uploaded_mesh_count js/window) (if u (count (:meshes u)) 0))
+        (set! (.-textContent status)
+              (if u (str "Uploaded VRM: " (:status u)) "No file loaded — using procedural character."))
+        ;; (re)build the expression carousel once the real presets are known —
+        ;; kami-ui-sdk.widgets/carousel! has no :set-items, so destroy+rebuild.
+        (when-let [{:keys [destroy]} (:uploaded-expr-carousel @!widgets)] (destroy))
+        (set! (.-textContent expr-row) "")
+        (when (and u (= "ready" (:status u)) (seq (:expr-names u)))
+          (swap! !widgets assoc :uploaded-expr-carousel
+                 (w/carousel! expr-row
+                   {:items (mapv (fn [n] {:id n :label n}) (:expr-names u))
+                    :value (:active-expr u)
+                    :on-change (fn [item] (swap! !uploaded assoc :active-expr (:id item)))})))))
+    (mk-button! container
+      {:test-id "clear-upload-btn" :label "Back to procedural" :bg (get-in ui/theme [:accent :blue])
+       :on-click (fn [_] (clear-uploaded!))})))
 
 ;; ─── main: WebGPU bootstrap, control panel, render loop (static pose — this
 ;; screen edits appearance, it isn't the auto-animating demo `preview_demo.
@@ -520,6 +677,34 @@
                 ((fn tick []
                    (js/requestAnimationFrame
                      (fn [_]
+                       (if-let [u (let [uv @!uploaded] (when (= "ready" (:status uv)) uv))]
+                         ;; ─── uploaded-VRM draw path: real mesh(es) instead of the
+                         ;; procedural character. Single shared camera/MVP (the whole
+                         ;; model was bbox-fit together in load-vrm-file!, not split
+                         ;; into head/body "portraits" the way the procedural path is).
+                         (let [vp (mesh/view-projection [0 0.15 2.6] [0 0 0] (/ w (max 1 h)))
+                               weights (when-let [mgr (:expr-mgr u)]
+                                         (:morphs (vexpr/resolve-expression mgr {(:active-expr u) 1.0})))
+                               enc (.createCommandEncoder device)
+                               view (.createView (.getCurrentTexture ctx))
+                               pass (.beginRenderPass enc
+                                      #js {:colorAttachments #js [#js {:view view :loadOp "clear" :storeOp "store"
+                                                                       :clearValue #js {:r 0.94 :g 0.92 :b 0.86 :a 1}}]
+                                           :depthStencilAttachment #js {:view (.createView depth-tex) :depthLoadOp "clear"
+                                                                        :depthStoreOp "store" :depthClearValue 1.0}})]
+                           (doseq [{:keys [mesh-idx primitives]} (:meshes u)]
+                             (doseq [[prim-idx {:keys [buffers]}] (map-indexed vector primitives)]
+                               (let [morph-count (:morph-count buffers)
+                                     morph-weights (if (pos? morph-count)
+                                                     (uploaded-morph-weights mesh-idx morph-count weights)
+                                                     [])
+                                     joint-count (:joint-count buffers)
+                                     joints (vec (repeat joint-count (identity-mat4)))
+                                     tex (get @!uploaded-textures [mesh-idx prim-idx])]
+                                 (mesh/draw! mctx pass buffers vp [1.0 1.0 1.0] morph-weights joints
+                                             (when tex {:texture tex})))))
+                           (.end pass)
+                           (.submit (.-queue device) #js [(.finish enc)]))
                        (when-let [{:keys [head body hair extras]} @!buffers]
                          (let [hair-mesh hair ;; disambiguate from the palette `:hair` color, below
                                vp (mesh/view-projection [0 0.25 2.4] [0 0 0] (/ w (max 1 h)))
@@ -569,7 +754,7 @@
                              (let [pattern (acc/draw-pattern id @!bone-world-pos)]
                                (mesh/draw! mctx pass buffers (if (= :head group) head-mvp body-mvp) color [] [] pattern)))
                            (.end pass)
-                           (.submit (.-queue device) #js [(.finish enc)])))
+                           (.submit (.-queue device) #js [(.finish enc)]))))
                        (tick))))
                  ))))
           (.catch (fn [err] (log "WebGPU init failed:" err)
