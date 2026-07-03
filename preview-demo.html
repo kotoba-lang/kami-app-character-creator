@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>character-creator Phase 2 preview (skin/morph WebGPU proof)</title>
+<style>
+  body { background: #111; color: #eee; font-family: sans-serif; margin: 0; padding: 12px; }
+  #gpu-canvas { width: 900px; height: 500px; display: block; background: #000; border: 1px solid #444; }
+  #status { padding: 6px 0; font-size: 14px; }
+</style>
+</head>
+<body>
+<h3>ADR-2607031200 Phase 2 — left: real character-creator head mesh (3185 real vertices) with a synthetic "puff" morph target animating (see note); right: synthetic 2-bone skinned strip bending</h3>
+<p style="max-width:900px;color:#aaa;font-size:13px">
+  Note: <code>character.blendshape/generate-arkit-targets</code> is a documented placeholder in
+  <code>kotoba-lang/character</code> — all 52 real ARKit morph deltas are <code>[0 0 0]</code> today
+  ("zero placeholder — populated from captured data or procedural rules"), confirmed by injecting a
+  weight=8.0 test and diffing screenshots (byte-identical to weight=0). The head mesh's geometry,
+  glTF morph-target wiring, and this page's WebGPU skin/morph shader are all real; target 0's delta is
+  substituted here with a synthetic per-vertex "puff along normal" so the shader path has something
+  non-zero to blend — content authoring for real ARKit deltas is separate, future work on
+  <code>character.blendshape</code> itself.
+</p>
+<div id="status">loading…</div>
+<canvas id="gpu-canvas"></canvas>
+<script src="dev/out/preview_demo.js"></script>
+</body>
+</html>

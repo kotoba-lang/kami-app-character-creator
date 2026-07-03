@@ -1,0 +1,6 @@
+{:main character-creator.preview-demo
+ :output-to "dev/out/preview_demo.js"
+ :output-dir "dev/out"
+ :optimizations :simple
+ :target :browser
+ :asset-path "out"}
