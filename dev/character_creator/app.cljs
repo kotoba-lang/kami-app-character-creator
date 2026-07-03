@@ -33,8 +33,12 @@
             [kami-ui-sdk.widgets :as w]
             [kami-ui-sdk.ui :as ui]
             [vrm.parse :as vparse]
+            [vrm.part :as vpart]
+            [vrm.compose :as vcompose]
+            [vrm.export :as vexport]
             [vrm.expression :as vexpr]
-            [vrm.spring :as vspring]))
+            [vrm.spring :as vspring]
+            [clojure.string :as str]))
 
 ;; ─── state ──────────────────────────────────────────────────────────────
 
@@ -89,6 +93,28 @@
                                         ;; kami.webgpu.mesh's own default-white fallback)
 (defonce !last-frame-time (atom nil))  ;; performance.now() of the previous rAF tick, for a real
                                         ;; dt feeding vrm.spring/step (nil on the very first frame)
+
+;; ─── multi-VRM library (CharacterStudio-inspired redesign, ADR-2607031200
+;; /loop maturity pass): studying M3-org/CharacterStudio's real
+;; `CharacterManager` showed its actual value isn't "view one uploaded
+;; file" — it's a per-CATEGORY trait picker backed by a manifest of many
+;; small pre-authored assets (`this.avatar[traitGroupID]`, swapped via
+;; `loadTrait`). We can't host/bundle ANY VRM asset ourselves (licensing —
+;; the whole reason this session's "load your own VRM" feature exists at
+;; all), so the adapted equivalent here is: let the USER build up their own
+;; small library by uploading multiple VRMs, `vrm.part/decompose` each into
+;; real category parts (`:body`/`:hair`/`:face`/`:outfit`/`:accessory`/
+;; `:other`), and `vrm.compose/compose` a "working" character from
+;; whichever part the user picks per category — the same category-swap UX,
+;; grounded in OUR real vrm.part/compose machinery instead of a hosted
+;; asset manifest. This is now the PRIMARY flow (moved to the top of the
+;; control panel); the original single-file "load-vrm-file!" upload is
+;; still exactly what happens when the library has exactly one entry with
+;; every category defaulted to it.
+(defonce !library (atom []))        ;; [{:filename :vdoc :parts} ...], one per uploaded VRM
+(defonce !active-parts (atom {}))   ;; category -> {:lib-idx :part-idx} — the current pick
+(defonce !library-panel-el (atom nil)) ;; container div the per-category pickers render into,
+                                        ;; rebuilt whenever the library or active picks change
 
 (defn- log [& xs] (.apply (.-log js/console) js/console (clj->js xs)))
 
@@ -418,72 +444,188 @@
   (reset! !uploaded-textures {})
   (reset! !last-frame-time nil))
 
-(defn load-vrm-file!
-  "`file`: a real `js/File` from a `<input type=file>` change event (or an
-   equivalent `.arrayBuffer()`-capable object, e.g. a test harness's
-   synthetic File). Parses via `vrm.parse/parse-vrm` (this session's earlier spike
-   proved this handles real production VRM 1.0 files, sparse-accessor
-   blend shapes included) and uploads every mesh's every primitive
-   (`gpu/mesh-primitives-by-index` — the multi-primitive-aware reader, since
-   an arbitrary uploaded file's mesh names can't be relied on the way
-   character-creator's own generated \"body\"/\"hair\"/... names can) as real
-   GPU buffers, kicking off async texture decode per primitive. On success,
-   `!uploaded` flips to `:status \"ready\"` and the render loop (below)
-   switches from drawing the procedural character to this real one — a
-   status line, not a mode-switcher UI, makes the switch visible; the
-   procedural sliders/carousels stay fully interactive throughout, they
-   just have no visible effect while an uploaded model is active (additive,
-   not a replacement — `clear-uploaded!` returns to the procedural view)."
+(defn clear-library! []
+  (reset! !library [])
+  (reset! !active-parts {})
+  (clear-uploaded!))
+
+(defn- prepare-uploaded-state!
+  "`vdoc`: any real `VrmDocument` (a freshly-parsed single upload, or a
+   freshly-`vrm.compose/compose`d mix of several) -> uploads every
+   mesh's every primitive as real GPU buffers (kicking off async texture
+   decode per primitive) and flips `!uploaded` to `:status \"ready\"`, same
+   contract this fn's logic had inline in the original single-file
+   `load-vrm-file!` before the library redesign extracted it so both the
+   single-upload path and the new multi-VRM recompose path share one
+   implementation instead of two copies."
+  [mctx vdoc]
+  (let [n-meshes (count (get-in vdoc [:gltf :meshes]))
+        primitives-by-mesh (mapv #(gpu/mesh-primitives-by-index vdoc %) (range n-meshes))
+        ;; one shared bbox fit across EVERY mesh's positions, so the whole
+        ;; model sits centred/scaled together in frame -- not each mesh
+        ;; independently re-centred (which would visibly pull parts apart).
+        fit (bbox-fit (mapcat (fn [prims] (mapcat :positions prims)) primitives-by-mesh))
+        meshes
+        (mapv
+          (fn [mesh-idx prims]
+            {:mesh-idx mesh-idx
+             ;; resolved ONCE here (glTF nodes point AT a mesh, so this is a lookup,
+             ;; not a per-frame cost) — nil for an unskinned mesh, in which case the
+             ;; render loop keeps the old identity-palette behaviour for it.
+             :skin-idx (:skin (gpu/mesh-node vdoc mesh-idx))
+             :primitives
+             (mapv
+               (fn [prim-idx {:keys [positions normals indices uvs joints weights material]}]
+                 (upload-primitive-texture! mctx vdoc mesh-idx prim-idx material)
+                 {:buffers (mesh/upload-mesh!
+                             mctx {:positions (fit-positions positions fit)
+                                   :normals normals :indices indices :uvs uvs
+                                   :joints joints :weights weights})})
+               (range (count prims)) prims)})
+          (range n-meshes) primitives-by-mesh)
+        expr-mgr (vexpr/new-manager (:expressions vdoc))
+        expr-names (mapv :name (:expressions vdoc))
+        spring-bones (:spring-bones vdoc)
+        spring-sim (when (seq spring-bones) (vspring/new-simulator vdoc))]
+    (reset! !uploaded-textures {})
+    (reset! !last-frame-time nil)
+    (reset! !uploaded {:vdoc vdoc :status "ready" :meshes meshes :fit fit
+                        :expr-mgr expr-mgr :expr-names expr-names
+                        :active-expr (first expr-names)
+                        :spring-sim spring-sim :spring-overrides {}})
+    (log "VRM ready for render —" n-meshes "meshes," (count expr-names) "expressions,"
+         (count spring-bones) "spring-bone chains")
+    (set! (.-__kami_cc_uploaded_spring_chains js/window) (count spring-bones))))
+
+(def ^:private category-order [:body :hair :face :outfit :accessory :other])
+
+(defn- library-categories
+  "Every category with at least one part somewhere in the library, in a
+   stable display order (`category-order`)."
+  []
+  (let [present (set (mapcat (fn [entry] (map :category (:parts entry))) @!library))]
+    (filter present category-order)))
+
+(defn- source-for-category
+  "`{:part :doc}` (a `vrm.compose/PartSource`) for `cat`'s current pick in
+   `!active-parts`, or `nil` if nothing is picked for that category yet."
+  [cat]
+  (when-let [{:keys [lib-idx part-idx]} (get @!active-parts cat)]
+    (when-let [entry (get @!library lib-idx)]
+      (when-let [part (get (:parts entry) part-idx)]
+        {:part part :doc (:vdoc entry)}))))
+
+(defn recompose-library!
+  "Rebuild the \"working\" composed character from `!active-parts`' current
+   picks and re-upload it for rendering. `:body`'s source is always ordered
+   FIRST into `vrm.compose/compose`'s `sources` (when present) so
+   `{:skeleton-base 0}` deterministically means \"use the body part's own
+   skeleton\" — every other part's joints get remapped onto that armature
+   by `vrm.compose/compose` itself (skeleton unification is its own first phase).
+   Resets to the procedural view (`clear-uploaded!`) if the library is
+   empty or nothing is picked for any category yet."
+  [mctx]
+  (let [cats (library-categories)
+        ordered (if (some #{:body} cats) (cons :body (remove #{:body} cats)) cats)
+        sources (vec (keep source-for-category ordered))]
+    (if (empty? sources)
+      (clear-uploaded!)
+      (try
+        (let [composed (vcompose/compose sources {:skeleton-base 0})]
+          (prepare-uploaded-state! mctx composed))
+        (catch :default err
+          (reset! !uploaded {:status (str "error composing: " err)})
+          (log "recompose-library! failed:" err))))))
+
+(declare render-library-panel!)
+
+(defn add-vrm-to-library!
+  "`file`: a real `js/File` (or synthetic equivalent) — parses it, decomposes
+   it into real category parts via `vrm.part/decompose`, APPENDS it to
+   `!library` (does not replace any previously-loaded VRM), auto-picks this
+   file's part for any category that has no active pick yet (so the very
+   first upload immediately shows something without extra clicks — the
+   original single-upload behaviour, now just \"library of 1\"), then
+   recomposes/re-renders and rebuilds the per-category picker UI so the new
+   options are selectable."
   [mctx file]
-  (reset! !uploaded {:status "loading…"})
   (-> (.arrayBuffer file)
       (.then
         (fn [ab]
           (try
             (let [bytes (vec (js/Uint8Array. ab))
                   vdoc (vparse/parse-vrm bytes)
-                  n-meshes (count (get-in vdoc [:gltf :meshes]))
-                  primitives-by-mesh (mapv #(gpu/mesh-primitives-by-index vdoc %) (range n-meshes))
-                  ;; one shared bbox fit across EVERY mesh's positions, so the whole
-                  ;; uploaded model sits centred/scaled together in frame -- not each
-                  ;; mesh independently re-centred (which would visibly pull parts apart).
-                  fit (bbox-fit (mapcat (fn [prims] (mapcat :positions prims)) primitives-by-mesh))
-                  meshes
-                  (mapv
-                    (fn [mesh-idx prims]
-                      {:mesh-idx mesh-idx
-                       ;; spring-bone follow-up: resolved ONCE here (glTF nodes point AT a
-                       ;; mesh, so this is a lookup, not a per-frame cost) — nil for an
-                       ;; unskinned mesh, in which case the render loop keeps the old
-                       ;; identity-palette behaviour for it.
-                       :skin-idx (:skin (gpu/mesh-node vdoc mesh-idx))
-                       :primitives
-                       (mapv
-                         (fn [prim-idx {:keys [positions normals indices uvs joints weights material]}]
-                           (upload-primitive-texture! mctx vdoc mesh-idx prim-idx material)
-                           {:buffers (mesh/upload-mesh!
-                                       mctx {:positions (fit-positions positions fit)
-                                             :normals normals :indices indices :uvs uvs
-                                             :joints joints :weights weights})})
-                         (range (count prims)) prims)})
-                    (range n-meshes) primitives-by-mesh)
-                  expr-mgr (vexpr/new-manager (:expressions vdoc))
-                  expr-names (mapv :name (:expressions vdoc))
-                  spring-bones (:spring-bones vdoc)
-                  spring-sim (when (seq spring-bones) (vspring/new-simulator vdoc))]
-              (reset! !uploaded-textures {})
-              (reset! !last-frame-time nil)
-              (reset! !uploaded {:vdoc vdoc :status "ready" :meshes meshes :fit fit
-                                  :expr-mgr expr-mgr :expr-names expr-names
-                                  :active-expr (first expr-names)
-                                  :spring-sim spring-sim :spring-overrides {}})
-              (log "uploaded VRM ready —" n-meshes "meshes," (count expr-names) "expressions,"
-                   (count spring-bones) "spring-bone chains")
-              (set! (.-__kami_cc_uploaded_spring_chains js/window) (count spring-bones)))
+                  parts (vpart/decompose vdoc)
+                  lib-idx (count @!library)]
+              (swap! !library conj {:filename (or (.-name file) (str "vrm-" lib-idx)) :vdoc vdoc :parts parts})
+              (doseq [[part-idx part] (map-indexed vector parts)]
+                (swap! !active-parts update (:category part)
+                       (fn [cur] (or cur {:lib-idx lib-idx :part-idx part-idx}))))
+              (log "added" (.-name file) "to library —" (count parts) "parts:"
+                   (str/join ", " (map (fn [p] (str (name (:category p)) "=" (:name p))) parts)))
+              (set! (.-__kami_cc_library_count js/window) (count @!library))
+              (render-library-panel! mctx)
+              (recompose-library! mctx))
             (catch :default err
-              (reset! !uploaded {:status (str "error: " err)})
-              (log "uploaded VRM parse failed:" err)))))
-      (.catch (fn [err] (reset! !uploaded {:status (str "error: " err)}) (log "uploaded VRM read failed:" err)))))
+              (log "add-vrm-to-library! parse/decompose failed:" err)
+              (set! (.-__kami_cc_library_error js/window) (str err)))))
+        )
+      (.catch (fn [err] (log "add-vrm-to-library! read failed:" err)
+                (set! (.-__kami_cc_library_error js/window) (str err))))))
+
+(defn- part-option-label [entry part]
+  (str (:filename entry) " — " (:name part)))
+
+(defn render-library-panel!
+  "(Re)builds the per-category part-picker UI into `!library-panel-el`'s
+   container div — called on init and after every library/pick change
+   (`kami-ui-sdk.widgets/carousel!` has no `:set-items`, so this always
+   destroys+rebuilds, same pattern the uploaded-expression carousel already
+   used). Empty library: a one-line placeholder note. Non-empty: a library
+   summary line + one `carousel!` per category present anywhere in the
+   library, each item labelled `\"<filename> — <part name>\"` so it's clear
+   which upload a given option comes from; picking one updates
+   `!active-parts` and triggers `recompose-library!`."
+  [mctx]
+  (when-let [el @!library-panel-el]
+    (set! (.-textContent el) "")
+    (let [lib @!library]
+      (if (empty? lib)
+        (let [d (.createElement js/document "div")]
+          (.setAttribute d "data-testid" "vrm-library-empty")
+          (set! (.-textContent d) "No VRMs loaded yet — using the procedural placeholder below.")
+          (.setProperty (.-style d) "font-size" "11px")
+          (.setProperty (.-style d) "color" (:text-secondary ui/theme))
+          (.appendChild el d))
+        (do
+          (let [summary (.createElement js/document "div")]
+            (.setAttribute summary "data-testid" "vrm-library-list")
+            (.setProperty (.-style summary) "font-size" "11px")
+            (.setProperty (.-style summary) "font-weight" "800")
+            (set! (.-textContent summary)
+                  (str (count lib) " VRM(s) loaded: " (str/join ", " (map :filename lib))))
+            (.appendChild el summary))
+          (doseq [cat (library-categories)]
+            (let [row (.createElement js/document "div")
+                  head (.createElement js/document "div")
+                  options (vec (for [[li entry] (map-indexed vector lib)
+                                      [pi part] (map-indexed vector (:parts entry))
+                                      :when (= cat (:category part))]
+                                  {:id [li pi] :label (part-option-label entry part)}))
+                  current (get @!active-parts cat)]
+              (.setAttribute row "data-testid" (str "part-carousel-" (name cat)))
+              (set! (.-textContent head) (str (str/capitalize (name cat)) ":"))
+              (.setProperty (.-style head) "font-size" "11px")
+              (.setProperty (.-style head) "font-weight" "800")
+              (.appendChild el head)
+              (.appendChild el row)
+              (w/carousel! row
+                {:items options
+                 :value (when current [(:lib-idx current) (:part-idx current)])
+                 :on-change (fn [item]
+                              (let [[li pi] (:id item)]
+                                (swap! !active-parts assoc cat {:lib-idx li :part-idx pi})
+                                (recompose-library! mctx)))}))))))))
 
 (defn- uploaded-morph-weights
   "`resolve-expression`'s `:morphs` is `{[mesh-idx morph-idx] weight}` (one
@@ -515,8 +657,79 @@
     (.appendChild container btn)
     btn))
 
+(defn- build-vrm-library-controls!
+  "The PRIMARY control-panel section (moved to the top, /loop maturity pass
+   redesign): upload one or more real VRM 1.0 files, mix-and-match their
+   decomposed parts per category, export the result. See `!library`'s
+   docstring for the CharacterStudio-adapted design rationale."
+  [container mctx]
+  (panel-heading container "Load your own VRM (primary)")
+  (let [note (.createElement js/document "div")
+        panel (.createElement js/document "div")
+        file-input (.createElement js/document "input")
+        expr-row (.createElement js/document "div")
+        status (.createElement js/document "div")]
+    (set! (.-textContent note)
+          "Bring your own VRM 1.0 avatar(s) — a VRoid Studio/Hub export, or any VRM you own. Add more than one to mix parts (hair/outfit/body/face/accessory) across them, inspired by M3-org/CharacterStudio's trait-swap design. No VRM yet? A procedural placeholder is generated below as a fallback.")
+    (.setProperty (.-style note) "font-size" "11px")
+    (.setProperty (.-style note) "color" (:text-secondary ui/theme))
+    (.appendChild container note)
+    (.setAttribute file-input "type" "file")
+    (.setAttribute file-input "accept" ".vrm")
+    (.setAttribute file-input "data-testid" "vrm-upload-input")
+    (.addEventListener file-input "change"
+      (fn [e]
+        (when-let [file (-> e .-target .-files (aget 0))]
+          (add-vrm-to-library! mctx file)
+          ;; clear the input's own value so re-selecting the SAME filename
+          ;; (e.g. re-adding a file to mix against itself) still fires a
+          ;; real `change` event — a file input suppresses `change` if the
+          ;; picked file(s) are identical to its current `.files`.
+          (set! (.-value file-input) ""))))
+    (.appendChild container file-input)
+    (.setAttribute panel "data-testid" "vrm-library-panel")
+    (reset! !library-panel-el panel)
+    (.appendChild container panel)
+    (render-library-panel! mctx)
+    (.setAttribute status "data-testid" "vrm-upload-status")
+    (.setProperty (.-style status) "font-size" "12px")
+    (.setProperty (.-style status) "font-weight" "800")
+    (set! (.-textContent status) "No file loaded — using procedural character.")
+    (.appendChild container status)
+    (.setAttribute expr-row "data-testid" "uploaded-expr-carousel")
+    (.appendChild container expr-row)
+    (add-watch !uploaded :status-line
+      (fn [_ _ _ u]
+        (set! (.-__kami_cc_uploaded_status js/window) (if u (:status u) nil))
+        (set! (.-__kami_cc_uploaded_mesh_count js/window) (if u (count (:meshes u)) 0))
+        (set! (.-textContent status)
+              (if u (str "Composed VRM: " (:status u)) "No file loaded — using procedural character."))
+        ;; (re)build the expression carousel once the real presets are known —
+        ;; kami-ui-sdk.widgets/carousel! has no :set-items, so destroy+rebuild.
+        (when-let [{:keys [destroy]} (:uploaded-expr-carousel @!widgets)] (destroy))
+        (set! (.-textContent expr-row) "")
+        (when (and u (= "ready" (:status u)) (seq (:expr-names u)))
+          (swap! !widgets assoc :uploaded-expr-carousel
+                 (w/carousel! expr-row
+                   {:items (mapv (fn [n] {:id n :label n}) (:expr-names u))
+                    :value (:active-expr u)
+                    :on-change (fn [item] (swap! !uploaded assoc :active-expr (:id item)))})))))
+    (mk-button! container
+      {:test-id "clear-upload-btn" :label "Clear all uploaded VRMs / back to procedural"
+       :bg (get-in ui/theme [:accent :blue])
+       :on-click (fn [_] (clear-library!) (render-library-panel! mctx))})
+    (mk-button! container
+      {:test-id "export-composed-btn" :label "Download composed .vrm" :bg (get-in ui/theme [:accent :green])
+       :on-click (fn [_]
+                   (when-let [u @!uploaded]
+                     (when (:vdoc u)
+                       (persist/download-vrm! {:character/name "composed-character"}
+                                               (vec (vexport/export-glb (:vdoc u))))
+                       (set! (.-__kami_cc_exported_composed js/window) true))))})))
+
 (defn- build-controls! [container mctx]
-  (panel-heading container "Body / Face")
+  (build-vrm-library-controls! container mctx)
+  (panel-heading container "Body / Face (procedural placeholder)")
   (doseq [[path label lo hi step] sliders]
     (let [row (.createElement js/document "div")]
       (.setAttribute row "data-testid" (str "slider-" (name (last path))))
@@ -612,56 +825,7 @@
     (mk-button! row
       {:test-id "export-edn-btn" :label "Download .edn" :bg (get-in ui/theme [:accent :green])
        :on-click (fn [_] (persist/download-edn! @!doc)
-                         (set! (.-__kami_cc_exported_edn js/window) true))}))
-
-  ;; ─── Load your own VRM — never bundle/commit a specific base model
-  ;; (licensing), ship the CAPABILITY to load a user-supplied one instead
-  ;; (M3-org/CharacterStudio's "drag and drop local 3D files" pattern).
-  ;; Additive: the procedural controls above stay fully live throughout.
-  (panel-heading container "Load your own VRM")
-  (let [note (.createElement js/document "div")
-        status (.createElement js/document "div")
-        expr-row (.createElement js/document "div")
-        file-input (.createElement js/document "input")]
-    (set! (.-textContent note)
-          "Bring your own VRM 1.0 avatar (VRoid Studio/Hub export, or any VRM you own) for a real sculpted model instead of the procedural one above.")
-    (.setProperty (.-style note) "font-size" "11px")
-    (.setProperty (.-style note) "color" (:text-secondary ui/theme))
-    (.appendChild container note)
-    (.setAttribute file-input "type" "file")
-    (.setAttribute file-input "accept" ".vrm")
-    (.setAttribute file-input "data-testid" "vrm-upload-input")
-    (.addEventListener file-input "change"
-      (fn [e]
-        (when-let [file (-> e .-target .-files (aget 0))]
-          (load-vrm-file! mctx file))))
-    (.appendChild container file-input)
-    (.setAttribute status "data-testid" "vrm-upload-status")
-    (.setProperty (.-style status) "font-size" "12px")
-    (.setProperty (.-style status) "font-weight" "800")
-    (set! (.-textContent status) "No file loaded — using procedural character.")
-    (.appendChild container status)
-    (.setAttribute expr-row "data-testid" "uploaded-expr-carousel")
-    (.appendChild container expr-row)
-    (add-watch !uploaded :status-line
-      (fn [_ _ _ u]
-        (set! (.-__kami_cc_uploaded_status js/window) (if u (:status u) nil))
-        (set! (.-__kami_cc_uploaded_mesh_count js/window) (if u (count (:meshes u)) 0))
-        (set! (.-textContent status)
-              (if u (str "Uploaded VRM: " (:status u)) "No file loaded — using procedural character."))
-        ;; (re)build the expression carousel once the real presets are known —
-        ;; kami-ui-sdk.widgets/carousel! has no :set-items, so destroy+rebuild.
-        (when-let [{:keys [destroy]} (:uploaded-expr-carousel @!widgets)] (destroy))
-        (set! (.-textContent expr-row) "")
-        (when (and u (= "ready" (:status u)) (seq (:expr-names u)))
-          (swap! !widgets assoc :uploaded-expr-carousel
-                 (w/carousel! expr-row
-                   {:items (mapv (fn [n] {:id n :label n}) (:expr-names u))
-                    :value (:active-expr u)
-                    :on-change (fn [item] (swap! !uploaded assoc :active-expr (:id item)))})))))
-    (mk-button! container
-      {:test-id "clear-upload-btn" :label "Back to procedural" :bg (get-in ui/theme [:accent :blue])
-       :on-click (fn [_] (clear-uploaded!))})))
+                         (set! (.-__kami_cc_exported_edn js/window) true))})))
 
 ;; ─── main: WebGPU bootstrap, control panel, render loop (static pose — this
 ;; screen edits appearance, it isn't the auto-animating demo `preview_demo.
