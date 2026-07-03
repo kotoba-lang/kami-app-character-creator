@@ -68,7 +68,9 @@
       (is (contains? attrs :WEIGHTS_0))
       (is (= 1 (count (:skins gltf))))
       (let [skin (first (:skins gltf))]
-        (is (= 13 (count (:joints skin))))
+        ;; 23 bones: the original 13 core + 10 added for the full-body
+        ;; extension (/loop maturity pass, ADR-2607031200 follow-up).
+        (is (= 23 (count (:joints skin))))
         (is (some? (:inverseBindMatrices skin))))
       ;; the body mesh's node references the skin.
       (let [mesh-idx (.indexOf (:meshes gltf) body-mesh)
@@ -82,4 +84,4 @@
           reparsed (vrm/parse-vrm bytes)
           gltf (:gltf reparsed)]
       (is (= 1 (count (:skins gltf))))
-      (is (= 13 (count (:joints (first (:skins gltf)))))))))
+      (is (= 23 (count (:joints (first (:skins gltf)))))))))

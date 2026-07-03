@@ -3,14 +3,18 @@
   character-creator head mesh morphing between REAL VRM expression presets, a
   synthetic 2-bone skinned strip bending (a controlled fixture, not a real
   avatar — proves the skinning math in isolation), and the real
-  character-creator BODY mesh — now really skinned (`character.body/
-  skin-body`, JOINTS_0/WEIGHTS_0) — posed by rotating its \"hips\" bone. All
-  three drawn through `kami.webgpu.mesh` (kotoba-lang/webgpu), the skin/morph
-  WebGPU executor. Dev-only entry point (`:cljs` alias), not part of the
-  portable pipeline. See `kami.webgpu.mesh`'s docstring for why this is a new
-  sibling executor rather than a `kami.webgpu.cljs` edit.
+  character-creator BODY mesh — now a full standing figure (`character.body/
+  generate-body`: torso + 2 legs + 2 arms, real JOINTS_0/WEIGHTS_0 via
+  `skin-body`) — posed by rotating its \"leftLowerLeg\" (knee) and
+  \"leftLowerArm\" (elbow) bones SIMULTANEOUSLY (independent thetas), proving
+  multi-joint skinning on the real avatar, not just a single dominant bone.
+  All three drawn through `kami.webgpu.mesh` (kotoba-lang/webgpu), the
+  skin/morph WebGPU executor. Dev-only entry point (`:cljs` alias), not part
+  of the portable pipeline. See `kami.webgpu.mesh`'s docstring for why this
+  is a new sibling executor rather than a `kami.webgpu.cljs` edit.
 
-  Two maturity-loop updates landed together here:
+  Three maturity-loop updates landed together here (across two `/loop`
+  iterations):
   1. `character.blendshape/generate-arkit-targets` no longer returns all-zero
      deltas for the 32 ARKit targets `character-creator.expression-bridge/
      preset->arkit-weights` references (see that namespace's `targets-spec`)
@@ -20,7 +24,11 @@
   2. `character.body/skin-body` attaches real JOINTS_0/WEIGHTS_0 to the body
      mesh (`character-creator.gpu-adapter/body-mesh-geometry` reads them back
      off the exported `VrmDocument`) — the body scene poses the real avatar
-     instead of only the synthetic arm."
+     instead of only the synthetic arm.
+  3. `character.body/generate-body` now builds a full standing figure (torso
+     + legs + arms, 23-bone skeleton) instead of a neck+upper-body bust —
+     this scene now poses two independent real joints (knee + elbow) instead
+     of the single \"hips\" pivot the bust-only mesh could meaningfully show."
   (:require [character-creator.doc :as doc]
             [character-creator.pipeline :as pipeline]
             [character-creator.gpu-adapter :as gpu]
@@ -68,10 +76,15 @@
     (js/Float32Array. #js [c s 0 0, (- s) c 0 0, 0 0 1 0, (- px rx) (- py ry) 0 1])))
 
 (defn- body-joint-matrices
-  "13-length joint palette: identity everywhere except `hips` (bone index 0),
-  which gets `pivot-rotate-z` around its own rest-pose world position."
-  [bone-world-pos theta]
-  (mapv (fn [i bp] (if (zero? i) (pivot-rotate-z bp theta) (identity-mat4)))
+  "Joint palette (length = bone count): identity everywhere except the bones
+  named in `theta-by-idx` (`{bone-idx theta}`), each independently posed via
+  `pivot-rotate-z` around its own rest-pose world position. Generalized
+  (/loop maturity pass, full-body follow-up) from the original single-`hips`
+  version to pose several joints (knee + elbow) at once, now that the
+  skeleton actually has them — this is the concrete proof multi-joint
+  skinning works, not just that one bone can move the whole mesh."
+  [bone-world-pos theta-by-idx]
+  (mapv (fn [i bp] (if-let [theta (get theta-by-idx i)] (pivot-rotate-z bp theta) (identity-mat4)))
         (range (count bone-world-pos)) bone-world-pos))
 
 ;; --- synthetic 2-bone bending strip (a controlled fixture that isolates the
@@ -182,6 +195,9 @@
                     skeleton (cbody/generate-humanoid-skeleton)
                     bone-world-pos-raw (cbody/bone-world-positions (:bones skeleton))
                     bone-world-pos (mapv #(fit-point % body-fit) bone-world-pos-raw)
+                    idx-by-name (into {} (map-indexed (fn [i b] [(:name b) i]) (:bones skeleton)))
+                    knee-idx (idx-by-name "leftLowerLeg")
+                    elbow-idx (idx-by-name "leftLowerArm")
                     body-buffers (mesh/upload-mesh!
                                    mctx {:positions (fit-positions (:positions body-geo) body-fit)
                                          :normals (:normals body-geo)
@@ -211,12 +227,21 @@
                              weights (mapv (fn [a b] (+ (* a (- 1.0 f)) (* b f))) w0 w1)
                              theta (* 0.8 (js/Math.sin (* tt 1.3)))
                              joints (arm-joint-matrices theta)
-                             ;; `window.__hipsTheta` (default an oscillation) lets headless-Chrome
-                             ;; verification pin an exact bend angle instead of racing requestAnimationFrame.
-                             body-theta (if (some? (.-__hipsTheta js/window))
-                                          (.-__hipsTheta js/window)
-                                          (* 0.6 (js/Math.sin (* tt 0.9))))
-                             body-joints (body-joint-matrices bone-world-pos body-theta)
+                             ;; `window.__kneeTheta`/`window.__elbowTheta` (default independent
+                             ;; oscillations) let headless-Chrome verification pin exact bend angles
+                             ;; instead of racing requestAnimationFrame. Full-body follow-up
+                             ;; (/loop maturity pass): poses the real leftLowerLeg (knee) + leftLowerArm
+                             ;; (elbow) bones the earlier skinning-only pass didn't have, replacing the
+                             ;; single-hips demo (already proven) with proof two independent joints on
+                             ;; the same real mesh bend correctly at once.
+                             knee-theta (if (some? (.-__kneeTheta js/window))
+                                          (.-__kneeTheta js/window)
+                                          (* 0.5 (+ 1.0 (js/Math.sin (* tt 0.7)))))
+                             elbow-theta (if (some? (.-__elbowTheta js/window))
+                                           (.-__elbowTheta js/window)
+                                           (* 0.6 (js/Math.sin (* tt 1.1))))
+                             body-joints (body-joint-matrices bone-world-pos
+                                                               {knee-idx knee-theta elbow-idx elbow-theta})
                              enc (.createCommandEncoder device)
                              view (.createView (.getCurrentTexture ctx))
                              pass (.beginRenderPass enc
