@@ -44,6 +44,8 @@
                                      ;; slider change visibly deforms the mesh rather than the
                                      ;; camera silently re-centering/re-zooming to compensate.
 (defonce !n-bones (atom 13))
+(defonce !widgets (atom {}))        ;; key -> widget instance ({:set-value ...}), so Randomize can
+                                     ;; push new values into the DOM, not just mutate !doc invisibly
 
 (defn- log [& xs] (.apply (.-log js/console) js/console (clj->js xs)))
 
@@ -275,14 +277,110 @@
        :value (or current :none)
        :on-change (fn [item] (on-select (when-not (= :none (:id item)) (:id item))))})))
 
+;; ─── save/load/randomize — makes the already-built pieces usable end-to-end
+;; (ADR-2607031200 Phase 1 shipped persist/save-local!, load-local,
+;; download-edn!/-vrm! but nothing called save-local!/load-local from the UI
+;; — only the .vrm export button was wired). ---------------------------------
+
+(defn- sync-widget-values!
+  "Push @!doc's current values into every captured widget's own displayed
+   state (kami-ui-sdk.widgets' :set-value, not raw DOM/atom mutation) — used
+   by both Load and Randomize so a slider visibly jumps to its new position
+   instead of the doc changing invisibly underneath a stale-looking control."
+  []
+  (doseq [[path {:keys [set-value]}] (:sliders @!widgets)]
+    (set-value (get-in @!doc (into [:character/def] path))))
+  (doseq [[k {:keys [set-value]}] (:swatches @!widgets)]
+    (set-value (rgb->hex (get (:character/palette @!doc) k))))
+  (when-let [{:keys [set-value]} (:hair-carousel @!widgets)]
+    (set-value (get-in @!doc [:character/def :hair :preset])))
+  (when-let [{:keys [set-value]} (:headwear-carousel @!widgets)]
+    (set-value (or (some (set (:headwear equip-slots)) (:character/equip @!doc)) :none)))
+  (when-let [{:keys [set-value]} (:jewelry-carousel @!widgets)]
+    (set-value (or (some (set (:jewelry equip-slots)) (:character/equip @!doc)) :none)))
+  (when-let [{:keys [set-value]} (:decal-carousel @!widgets)]
+    (set-value (or (first (:character/decals @!doc)) :none)))
+  (when-let [{:keys [set-value]} (:expr-carousel @!widgets)]
+    (set-value @!active-preset)))
+
+(defn- save! []
+  (persist/save-local! @!doc)
+  (set! (.-__kami_cc_last_save js/window) (:character/id @!doc)))
+
+(defn- load! [mctx]
+  ;; No multi-character picker exists in this screen yet (single doc/id at a
+  ;; time) — "Load" reloads whatever was last saved under the CURRENT
+  ;; character's own :character/id, i.e. "load last saved," per directive.
+  ;; A real character-switcher (persist/list-local-ids already supports
+  ;; multiple ids) is a follow-up, not fabricated here.
+  (when-let [loaded (persist/load-local (:character/id @!doc))]
+    (reset! !doc loaded)
+    (sync-widget-values!)
+    (regen! mctx)
+    (set! (.-__kami_cc_last_load js/window) (:character/id loaded))))
+
+(defn- rand-channel [] (+ 0.15 (* (js/Math.random) 0.75)))
+(defn- rand-hex [] (rgb->hex [(rand-channel) (rand-channel) (rand-channel)]))
+
+(defn- randomize! [mctx]
+  (let [hair-list (vec params/hair-presets)
+        decal-list (into [nil] (keys acc/decal-catalog))
+        expr-list (vec (keys bridge/preset->arkit-weights))
+        new-def (reduce (fn [d [path _ lo hi step]]
+                           (let [raw (+ lo (* (js/Math.random) (- hi lo)))
+                                 snapped (* step (js/Math.round (/ raw step)))]
+                             (assoc-in d path (-> snapped (max lo) (min hi)))))
+                         (:character/def @!doc)
+                         sliders)
+        skin-hex (rand-hex) hair-hex (rand-hex) eye-hex (rand-hex)
+        new-def (-> new-def
+                    (assoc-in [:skin :tone] (hex->rgb skin-hex))
+                    (assoc-in [:hair :color] (hex->rgb hair-hex))
+                    (assoc-in [:eyes :iris-color] (hex->rgb eye-hex))
+                    (assoc-in [:hair :preset] (rand-nth hair-list)))
+        headwear (rand-nth [nil :cap-simple :glasses-round])
+        jewelry (rand-nth [nil :earring-stud :necklace-simple])
+        decal (rand-nth decal-list)
+        expr (rand-nth expr-list)]
+    (swap! !doc
+           (fn [d]
+             (-> d
+                 (assoc :character/def new-def)
+                 (assoc-in [:character/palette :skin] (hex->rgb skin-hex))
+                 (assoc-in [:character/palette :hair] (hex->rgb hair-hex))
+                 (assoc-in [:character/palette :eye] (hex->rgb eye-hex))
+                 (assoc :character/equip (vec (remove nil? [headwear jewelry])))
+                 (assoc :character/decals (if decal [decal] [])))))
+    (reset! !active-preset expr)
+    (sync-widget-values!)
+    (regen! mctx)
+    (set! (.-__kami_cc_randomize_count js/window) (inc (or (.-__kami_cc_randomize_count js/window) 0)))))
+
+(defn- mk-button! [container {:keys [test-id label bg on-click]}]
+  (let [btn (.createElement js/document "button")]
+    (.setAttribute btn "data-testid" test-id)
+    (set! (.-textContent btn) label)
+    (.setProperty (.-style btn) "background" bg)
+    (.setProperty (.-style btn) "border" "none")
+    (.setProperty (.-style btn) "border-radius" (:radius-small ui/theme))
+    (.setProperty (.-style btn) "padding" "10px 14px")
+    (.setProperty (.-style btn) "font-weight" "800")
+    (.setProperty (.-style btn) "cursor" "pointer")
+    (.setProperty (.-style btn) "color" "#fff")
+    (.setProperty (.-style btn) "margin-right" "8px")
+    (.addEventListener btn "click" on-click)
+    (.appendChild container btn)
+    btn))
+
 (defn- build-controls! [container mctx]
   (panel-heading container "Body / Face")
   (doseq [[path label lo hi step] sliders]
     (let [row (.createElement js/document "div")]
       (.setAttribute row "data-testid" (str "slider-" (name (last path))))
       (.appendChild container row)
-      (w/slider! row {:label label :min lo :max hi :step step :value (get-def path)
-                       :on-change (fn [v] (update-def! mctx path v))})))
+      (swap! !widgets assoc-in [:sliders path]
+             (w/slider! row {:label label :min lo :max hi :step step :value (get-def path)
+                              :on-change (fn [v] (update-def! mctx path v))}))))
 
   (panel-heading container "Colors")
   (let [row (.createElement js/document "div")]
@@ -299,64 +397,79 @@
         (.setProperty (.-style lab) "width" "34px")
         (.appendChild wrap lab)
         (.appendChild row wrap)
-        (w/color-swatch! wrap
-          {:presets [(rgb->hex (get (:character/palette @!doc) k))
-                     "#f4c9a8" "#ecd0b0" "#caa27a" "#8a5a3a" "#3f2a20"]
-           :value (rgb->hex (get (:character/palette @!doc) k))
-           :on-change (fn [hex] (update-palette! mctx k hex))}))))
+        (swap! !widgets assoc-in [:swatches k]
+               (w/color-swatch! wrap
+                 {:presets [(rgb->hex (get (:character/palette @!doc) k))
+                            "#f4c9a8" "#ecd0b0" "#caa27a" "#8a5a3a" "#3f2a20"]
+                  :value (rgb->hex (get (:character/palette @!doc) k))
+                  :on-change (fn [hex] (update-palette! mctx k hex))})))))
 
   (panel-heading container "Hair style")
   (let [row (.createElement js/document "div")]
     (.setAttribute row "data-testid" "hair-carousel")
     (.appendChild container row)
-    (w/carousel! row
-      {:items (mapv (fn [p] {:id p :label (name p) :thumbnail (hair-thumbnail-fn p)})
-                     (sort params/hair-presets))
-       :value (get-def [:hair :preset])
-       :on-change (fn [item] (update-def! mctx [:hair :preset] (:id item)))}))
+    (swap! !widgets assoc :hair-carousel
+           (w/carousel! row
+             {:items (mapv (fn [p] {:id p :label (name p) :thumbnail (hair-thumbnail-fn p)})
+                            (sort params/hair-presets))
+              :value (get-def [:hair :preset])
+              :on-change (fn [item] (update-def! mctx [:hair :preset] (:id item)))})))
 
   (panel-heading container "Headwear")
-  (slot-carousel! container mctx
-    {:test-id "headwear-carousel" :ids (:headwear equip-slots)
-     :current (some (set (:headwear equip-slots)) (:character/equip @!doc))
-     :on-select (fn [id] (set-equip-slot! mctx :headwear id))})
+  (swap! !widgets assoc :headwear-carousel
+         (slot-carousel! container mctx
+           {:test-id "headwear-carousel" :ids (:headwear equip-slots)
+            :current (some (set (:headwear equip-slots)) (:character/equip @!doc))
+            :on-select (fn [id] (set-equip-slot! mctx :headwear id))}))
 
   (panel-heading container "Jewelry")
-  (slot-carousel! container mctx
-    {:test-id "jewelry-carousel" :ids (:jewelry equip-slots)
-     :current (some (set (:jewelry equip-slots)) (:character/equip @!doc))
-     :on-select (fn [id] (set-equip-slot! mctx :jewelry id))})
+  (swap! !widgets assoc :jewelry-carousel
+         (slot-carousel! container mctx
+           {:test-id "jewelry-carousel" :ids (:jewelry equip-slots)
+            :current (some (set (:jewelry equip-slots)) (:character/equip @!doc))
+            :on-select (fn [id] (set-equip-slot! mctx :jewelry id))}))
 
   (panel-heading container "Tattoo / Scar")
-  (slot-carousel! container mctx
-    {:test-id "decal-carousel" :ids (keys acc/decal-catalog)
-     :current (first (:character/decals @!doc))
-     :on-select (fn [id] (set-decal! mctx id))})
+  (swap! !widgets assoc :decal-carousel
+         (slot-carousel! container mctx
+           {:test-id "decal-carousel" :ids (keys acc/decal-catalog)
+            :current (first (:character/decals @!doc))
+            :on-select (fn [id] (set-decal! mctx id))}))
 
   (panel-heading container "Expression preview")
   (let [row (.createElement js/document "div")]
     (.setAttribute row "data-testid" "expr-carousel")
     (.appendChild container row)
-    (w/carousel! row
-      {:items (mapv (fn [p] {:id p :label (name p)}) (sort (keys bridge/preset->arkit-weights)))
-       :value :neutral
-       :on-change (fn [item] (reset! !active-preset (:id item)))}))
+    (swap! !widgets assoc :expr-carousel
+           (w/carousel! row
+             {:items (mapv (fn [p] {:id p :label (name p)}) (sort (keys bridge/preset->arkit-weights)))
+              :value :neutral
+              :on-change (fn [item] (reset! !active-preset (:id item)))})))
+
+  (panel-heading container "Randomize")
+  (mk-button! container
+    {:test-id "randomize-btn" :label "🎲 Randomize" :bg (get-in ui/theme [:accent :purple])
+     :on-click (fn [_] (randomize! mctx))})
+
+  (panel-heading container "Save / Load")
+  (let [row (.createElement js/document "div")]
+    (.appendChild container row)
+    (mk-button! row {:test-id "save-btn" :label "Save" :bg (get-in ui/theme [:accent :blue])
+                      :on-click (fn [_] (save! ))})
+    (mk-button! row {:test-id "load-btn" :label "Load" :bg (get-in ui/theme [:accent :blue])
+                      :on-click (fn [_] (load! mctx))}))
 
   (panel-heading container "Export")
-  (let [btn (.createElement js/document "button")]
-    (.setAttribute btn "data-testid" "export-btn")
-    (set! (.-textContent btn) "Download .vrm")
-    (.setProperty (.-style btn) "background" (get-in ui/theme [:accent :green]))
-    (.setProperty (.-style btn) "border" "none")
-    (.setProperty (.-style btn) "border-radius" (:radius-small ui/theme))
-    (.setProperty (.-style btn) "padding" "10px 14px")
-    (.setProperty (.-style btn) "font-weight" "800")
-    (.setProperty (.-style btn) "cursor" "pointer")
-    (.setProperty (.-style btn) "color" "#fff")
-    (.addEventListener btn "click"
-      (fn [_] (persist/download-vrm! @!doc (pipeline/character-doc->vrm-bytes @!doc))
-              (set! (.-__kami_cc_exported js/window) true)))
-    (.appendChild container btn)))
+  (let [row (.createElement js/document "div")]
+    (.appendChild container row)
+    (mk-button! row
+      {:test-id "export-btn" :label "Download .vrm" :bg (get-in ui/theme [:accent :green])
+       :on-click (fn [_] (persist/download-vrm! @!doc (pipeline/character-doc->vrm-bytes @!doc))
+                         (set! (.-__kami_cc_exported js/window) true))})
+    (mk-button! row
+      {:test-id "export-edn-btn" :label "Download .edn" :bg (get-in ui/theme [:accent :green])
+       :on-click (fn [_] (persist/download-edn! @!doc)
+                         (set! (.-__kami_cc_exported_edn js/window) true))})))
 
 ;; ─── main: WebGPU bootstrap, control panel, render loop (static pose — this
 ;; screen edits appearance, it isn't the auto-animating demo `preview_demo.
