@@ -83,5 +83,5 @@ correctly (GLB magic header, humanoid bones, all 18 expressions).
   `kotoba-lang/webgpu`).
 - kotobase.net save/publish (Phase 3 — blocked on `kotoba-client` growing a
   write path; `persistence.cljc` ships local-only for now).
-- Slider/ColorSwatch/Carousel UI widgets (Phase 4 — `kami-ui-sdk` has none
-  yet).
+- Slider/ColorSwatch/Carousel UI widgets (Phase 4 — `kami-engine-app-sdk`,
+  renamed from `kami-ui-sdk`, has none yet).
