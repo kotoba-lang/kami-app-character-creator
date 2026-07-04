@@ -18,7 +18,7 @@
            ;; /loop maturity pass — the real interactive character-creation screen
            ;; (`app.html`/`character-creator.app`), same dev-only shape as `:cljs`
            ;; above plus `kami-engine-app-sdk` (renamed from `kami-ui-sdk`, see
-           ;; com-junkawasaki/root ADR-2607041500; namespace stays
+           ;; com-junkawasaki/root ADR-2607051200; namespace stays
            ;; `kami-ui-sdk.widgets`'s real DOM slider/color-swatch/carousel).
            :cljs-app {:extra-paths ["dev"]
                       :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
