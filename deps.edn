@@ -1,7 +1,7 @@
 {:paths ["src"]
- ;; west checks this repo out as a sibling of orgs/kotoba-lang/{vrm,character}
+ ;; west checks this repo out as a sibling of orgs/kotoba-lang/{org-vrmc-vrm,character}
  ;; (orgs/kotoba-lang/kami-app-character-creator/), so relative :local/root resolves.
- :deps {io.github.kotoba-lang/vrm {:local/root "../vrm"}
+ :deps {io.github.kotoba-lang/org-vrmc-vrm {:local/root "../org-vrmc-vrm"}
         io.github.kotoba-lang/character {:local/root "../character"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
