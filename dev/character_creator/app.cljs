@@ -71,19 +71,35 @@
 (defonce !uploaded (atom nil))
 ;; nil, or {:vdoc :status ("loading"/"ready"/"error: ...") :meshes [{:mesh-idx
 ;;  :skin-idx :primitives [{:buffers :material :joint-count}]}] :fit
-;;  {:center :scale} :expr-mgr :expr-names :active-expr :spring-sim
-;;  :spring-overrides}. :textures is a SEPARATE atom (below) since texture
-;; decode is async and must not block the rest of this map.
+;;  {:center :scale} :expr-mgr :expr-names :active-expr}. :textures is a
+;; SEPARATE atom (below) since texture decode is async and must not block
+;; the rest of this map. :spring-sim/:spring-overrides are ALSO separate
+;; (`!uploaded-spring`, below) — NOT stored here — see that atom's docstring
+;; for why (bug found by playtesting, /loop maturity pass follow-up).
 ;;
 ;; :skin-idx (spring-bone follow-up, /loop maturity pass): which glTF `skins`
 ;; entry (if any) this mesh's node references — resolved once at load time
-;; via `gpu/mesh-node`, not per-frame. :spring-sim/:spring-overrides drive
-;; real jiggle physics instead of the all-identity joint palette this render
-;; path used before: :spring-sim is `vrm.spring/new-simulator`'s threaded
-;; state (nil if the uploaded model has no spring bones at all — most VRMs
-;; do, per VRMC_springBone, but it's optional); :spring-overrides is the
-;; PREVIOUS frame's `vrm.spring/step` output, reduced to a `{node-idx quat}`
-;; map — `vrm.spring/step`'s own docstring: the node-world it's given should
+;; via `gpu/mesh-node`, not per-frame.
+
+(defonce !uploaded-spring (atom {:spring-sim nil :spring-overrides {}}))
+;; `{:spring-sim :spring-overrides}`, split out of `!uploaded` (/loop
+;; maturity pass, bug found via Playwright playtesting — ADR-2607031200):
+;; the render loop updates this EVERY animation frame (`vrm.spring/step`
+;; runs every tick regardless of user input, per VRMC_springBone), so it
+;; cannot live in `!uploaded` alongside the UI-reactive fields — `!uploaded`
+;; has `(add-watch !uploaded :status-line ...)` below, which destroys and
+;; rebuilds the whole uploaded-expression `carousel!` DOM subtree on every
+;; change. Before this split, that watch fired ~60x/sec (confirmed via a
+;; MutationObserver: dozens of childList mutations per second on the
+;; carousel container with ZERO user interaction), tearing down and
+;; recreating the expression picker's buttons/listeners every frame — which
+;; made it observably unclickable in a real Playwright session (`locator.
+;; click` timed out with "element was detached from the DOM, retrying").
+;; `:spring-sim` is `vrm.spring/new-simulator`'s threaded state (nil if the
+;; uploaded model has no spring bones at all — most VRMs do, per
+;; VRMC_springBone, but it's optional); `:spring-overrides` is the PREVIOUS
+;; frame's `vrm.spring/step` output, reduced to a `{node-idx quat}` map —
+;; `vrm.spring/step`'s own docstring: the node-world it's given should
 ;; reflect the previous frame's spring-posed world (rest pose on frame 0),
 ;; so the cascade carries forward frame-to-frame with one frame of latency,
 ;; matching the original Rust behaviour.
@@ -236,22 +252,67 @@
     (set! (.-__kami_cc_last_hair_preset js/window) (name (get-in @!doc [:character/def :hair :preset])))
     (set! (.-__kami_cc_last_extras js/window) (clj->js (mapv name (keys extras))))))
 
+;; ─── slider-drag regen coalescing (found by playtesting, /loop maturity pass
+;; follow-up) ---------------------------------------------------------------
+;; A real Playwright drag across `slider!`'s track fires a `pointermove` (and
+;; therefore an `:on-change` -> `update-def!` -> `regen!`) roughly every few
+;; pixels of movement — measured ~43 events across one ~300px drag. `regen!`
+;; is not cheap: it re-derives the WHOLE `VrmDocument` from `@!doc`, re-reads
+;; every mesh's accessors from scratch, and re-uploads fresh GPU buffers for
+;; head+body+hair+every equipped extra. Measured with this app's own default
+;; doc (head 3185 / body 2377 / hair 5304 verts): ~2.2 SECONDS per call in
+;; this sandbox's headless/software-rendered environment. Since JS is single-
+;; threaded, calling `regen!` synchronously on every `pointermove` serializes
+;; ~43 back-to-back 2.2s calls — the page is unresponsive for essentially the
+;; entire drag (confirmed: `requestAnimationFrame` deltas up to 2.3s during a
+;; drag, vs. the ~16.7ms a 60fps frame budget allows). `schedule-regen!`
+;; coalesces this to at most one `regen!` per animation frame: `!doc` itself
+;; is still updated synchronously on every event (so the value is always
+;; current even if a frame's worth of intermediate mesh rebuilds is skipped),
+;; only the expensive rebuild+upload is throttled to rAF cadence.
+(defonce !regen-pending? (atom false))
+
+(defn- schedule-regen! [mctx]
+  (when (compare-and-set! !regen-pending? false true)
+    (js/requestAnimationFrame
+      (fn [_]
+        ;; Reset the flag AFTER regen! returns, not before — `regen!` is
+        ;; itself synchronous and (per the ~2.2s measurement above) far
+        ;; slower than one frame, so resetting the flag first would re-arm
+        ;; scheduling while the expensive call is still running, letting the
+        ;; very next queued pointermove immediately schedule another one
+        ;; (measured: this actually-wrong first attempt only cut regen calls
+        ;; from 43 to 42 across the same drag — no real coalescing at all).
+        ;; Keeping the flag true for the full regen! duration means every
+        ;; pointermove that arrives while a regen is in flight only updates
+        ;; `!doc` (cheap) and is dropped as a redundant reschedule; the next
+        ;; regen! (once scheduled) always reads the LATEST `@!doc`, so no
+        ;; user-visible value is lost, only the intermediate mesh rebuilds.
+        (regen! mctx)
+        (reset! !regen-pending? false)))))
+
 (defn- update-def! [mctx path v]
   (swap! !doc assoc-in (into [:character/def] path) v)
-  (regen! mctx))
+  (schedule-regen! mctx))
 
 (def ^:private palette-key->def-path
   "Mirrors `character-creator.doc/apply-palette`'s mapping (private there —
    `boot-config`-only — so re-stated here for a live doc's in-place update)."
   {:skin [:skin :tone] :hair [:hair :color] :eye [:eyes :iris-color]})
 
-(defn- update-palette! [mctx k hex]
+(defn- update-palette!
+  "No `regen!` call needed (found while investigating why swatch clicks were
+   as slow as slider drags): the render loop reads `:character/palette` off
+   `!doc` fresh every single frame for the head/body/hair draw-call color
+   (see the comment on the `(:character/palette` deref in the render loop
+   below) — a palette change is visible on the very next frame for free.
+   `mctx` is kept in the signature to avoid touching call sites."
+  [mctx k hex]
   (let [rgb (hex->rgb hex)]
     (swap! !doc (fn [d]
                   (-> d
                       (assoc-in [:character/palette k] rgb)
-                      (assoc-in (into [:character/def] (palette-key->def-path k)) rgb)))))
-  (regen! mctx))
+                      (assoc-in (into [:character/def] (palette-key->def-path k)) rgb))))))
 
 ;; ─── control panel ─────────────────────────────────────────────────────
 
@@ -442,6 +503,7 @@
 (defn clear-uploaded! []
   (reset! !uploaded nil)
   (reset! !uploaded-textures {})
+  (reset! !uploaded-spring {:spring-sim nil :spring-overrides {}})
   (reset! !last-frame-time nil))
 
 (defn clear-library! []
@@ -489,10 +551,13 @@
         spring-sim (when (seq spring-bones) (vspring/new-simulator vdoc))]
     (reset! !uploaded-textures {})
     (reset! !last-frame-time nil)
+    ;; :spring-sim/:spring-overrides live in !uploaded-spring, NOT !uploaded
+    ;; (see that atom's docstring) — reset separately so the per-frame render
+    ;; loop update never touches !uploaded's own reactive :status-line watch.
+    (reset! !uploaded-spring {:spring-sim spring-sim :spring-overrides {}})
     (reset! !uploaded {:vdoc vdoc :status "ready" :meshes meshes :fit fit
                         :expr-mgr expr-mgr :expr-names expr-names
-                        :active-expr (first expr-names)
-                        :spring-sim spring-sim :spring-overrides {}})
+                        :active-expr (first expr-names)})
     (log "VRM ready for render —" n-meshes "meshes," (count expr-names) "expressions,"
          (count spring-bones) "spring-bone chains")
     (set! (.-__kami_cc_uploaded_spring_chains js/window) (count spring-bones))))
@@ -894,14 +959,20 @@
                                     (/ 1.0 60.0))
                                _ (reset! !last-frame-time now)
                                vdoc (:vdoc u)
-                               node-world-for-step (gpu/node-world-transforms vdoc (:spring-overrides u))
+                               spring-state @!uploaded-spring
+                               node-world-for-step (gpu/node-world-transforms vdoc (:spring-overrides spring-state))
                                [new-sim step-overrides]
-                               (if-let [sim (:spring-sim u)]
+                               (if-let [sim (:spring-sim spring-state)]
                                  (vspring/step sim dt node-world-for-step)
                                  [nil []])
                                overrides-map (into {} step-overrides)
-                               _ (when (:spring-sim u)
-                                   (swap! !uploaded assoc :spring-sim new-sim :spring-overrides overrides-map))
+                               ;; !uploaded-spring, NOT !uploaded — this fires every rAF
+                               ;; tick, and !uploaded has a reactive `add-watch` (below)
+                               ;; that rebuilds the expression-carousel DOM; routing this
+                               ;; per-frame update through !uploaded made that carousel
+                               ;; unusable (see !uploaded-spring's docstring).
+                               _ (when (:spring-sim spring-state)
+                                   (reset! !uploaded-spring {:spring-sim new-sim :spring-overrides overrides-map}))
                                final-node-world (gpu/node-world-transforms vdoc overrides-map)
                                vp (mesh/view-projection [0 0.15 2.6] [0 0 0] (/ w (max 1 h)))
                                weights (when-let [mgr (:expr-mgr u)]

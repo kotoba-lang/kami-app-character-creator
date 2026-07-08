@@ -6,7 +6,16 @@
 <style>
   body { background: #f0ead6; color: #2d3436; font-family: 'Nunito', system-ui, -apple-system, sans-serif; margin: 0; padding: 16px; }
   #app { display: flex; gap: 20px; align-items: flex-start; }
-  #gpu-canvas { width: 560px; height: 480px; display: block; background: #000; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+  /* Sticky canvas (found by playtesting): the control panel below (VRM
+     library, sliders, colors, carousels, randomize/save/load/export) is
+     much taller than the viewport, and #app has no shared scroll container
+     -- without this, scrolling down to reach e.g. Headwear/Jewelry/Export
+     scrolls the live-rendered avatar completely out of view, so the very
+     feedback the sliders/swatches exist to show is invisible while using
+     the controls that are below the fold. `position: sticky` keeps the
+     canvas pinned near the top of the viewport as the controls column
+     scrolls past it. */
+  #gpu-canvas { width: 560px; height: 480px; display: block; background: #000; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); position: sticky; top: 16px; }
   #controls { width: 300px; display: flex; flex-direction: column; gap: 10px; }
   #status { padding: 8px 0; font-size: 13px; font-weight: 800; }
 </style>
