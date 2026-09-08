@@ -38,7 +38,7 @@
             [vrm.export :as vexport]
             [vrm.expression :as vexpr]
             [vrm.spring :as vspring]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 ;; ─── state ──────────────────────────────────────────────────────────────
 
