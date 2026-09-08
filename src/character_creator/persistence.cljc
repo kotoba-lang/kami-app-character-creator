@@ -22,7 +22,7 @@
   `clojure.core/read-string`, which can `eval` arbitrary forms — `edn/read-
   string` is the safe reader for data written by our own `pr-str`, matching
   what `save-local!` produces)."
-  (:require [vrm.glb :as glb]
+  (:require [kotoba.lang.text] [vrm.glb :as glb]
             #?(:clj [clojure.edn :as edn] :cljs [cljs.reader :as edn])))
 
 (def ^:private storage-key-prefix "kami-character-creator/")
@@ -49,7 +49,7 @@
   #?(:cljs (let [n (.-length js/localStorage)]
              (vec (keep (fn [i]
                           (let [k (.key js/localStorage i)]
-                            (when (clojure.string/starts-with? k storage-key-prefix)
+                            (when (kotoba.lang.text/starts-with? k storage-key-prefix)
                               (subs k (count storage-key-prefix)))))
                         (range n))))
      :clj (not-browser! "list-local-ids")))
