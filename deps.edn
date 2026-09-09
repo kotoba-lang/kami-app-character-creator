@@ -12,7 +12,7 @@
                                      :git/sha "197410ae8fab61c2bc46c690fc6affbec046928f"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
-                               {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                               {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
                   :main-opts ["-m" "cognitect.test-runner"]}
            ;; Phase 2 (ADR-2607031200) preview-demo.html build only. `../webgpu`
            ;; is `kotoba.lang/webgpu`'s `kami.webgpu.mesh` (skin/morph executor) —
