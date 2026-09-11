@@ -1,0 +1,21 @@
+{:format :kotoba.cljk-origin/v1
+ :renamed-on "2026-09-11"
+ :decision "adr-2609111500-cljk-rename-all-clojure-source (com-junkawasaki/root 90-docs/adr; owner instruction 2026-09-11)"
+ :rule "value = the extension the file had before the rename. A path ending in .clj.cljk or .cljs.cljk kept it in the name because both platform files existed (or the plain target was taken)."
+ :origins
+ {"dev/character_creator/app.cljk" ".cljs"
+  "dev/character_creator/pattern_demo.cljk" ".cljs"
+  "dev/character_creator/preview_demo.cljk" ".cljs"
+  "src/character_creator/accessories.cljk" ".cljc"
+  "src/character_creator/doc.cljk" ".cljc"
+  "src/character_creator/expression_bridge.cljk" ".cljc"
+  "src/character_creator/gltf_build.cljk" ".cljc"
+  "src/character_creator/gpu_adapter.cljk" ".cljc"
+  "src/character_creator/persistence.cljk" ".cljc"
+  "src/character_creator/pipeline.cljk" ".cljc"
+  "src/character_creator/thumbnail.cljk" ".cljc"
+  "test/character_creator/accessories_test.cljk" ".cljc"
+  "test/character_creator/doc_test.cljk" ".cljc"
+  "test/character_creator/expression_bridge_test.cljk" ".cljc"
+  "test/character_creator/gpu_adapter_test.cljk" ".cljc"
+  "test/character_creator/pipeline_test.cljk" ".cljc"}}
