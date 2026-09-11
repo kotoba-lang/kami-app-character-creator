@@ -70,7 +70,7 @@ CharacterDoc (EDN)
 ## Test
 
 ```bash
-clojure -M:test
+kbb -M:test
 ```
 
 11 tests / 81 assertions, including a full round-trip: `CharacterDoc ->
